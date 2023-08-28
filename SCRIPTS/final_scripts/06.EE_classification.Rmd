@@ -1,0 +1,1173 @@
+---
+title: "EE_ME_classification"
+author: "Miguel Parra"
+date: '2023-06-16'
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The idea of this notebook is to check if machine learning is able to differentiate patients that were exposed to famine during early embryonic development (first 3 months of pregnancy) and control patients that were not exposed to phamine, using methylation data and genomic data (PRS and SNPs). This is similar to previous approaches but instead of using the matrix with biallelic SNPs, the different PRS at different thresholds are also used.
+
+## 0. Set-up
+
+```{r, include=FALSE}
+library ("tidyverse") 
+library ("ggplot2")
+library ("minfi")
+library ("MUVR")
+library ("doParallel")
+library ("bigsnpr")
+library ("bigstatsr")
+library ("pROC")
+library ("randomForest")
+library ("caret")
+library ("Rtsne")
+library ("janitor")
+```
+
+
+Import data:
+
+```{r}
+
+#Metadata: ----
+samples_metadata <- readRDS("OUTPUT/feature_selection/rds/samples_metadata.rds")
+
+
+#Methylation data: ----
+grset <- readRDS("OUTPUT/methylation_preprocessing/rdsDir/grset_normalized_noSNPs_noSex.Rds")
+beta_values <- getBeta (grset)
+
+
+#Genomic data: ----
+snp_array <- readRDS("OUTPUT/genomic_preprocessing/rdsDir/bigSNPr_prepro.rds")
+
+G <- snp_fastImputeSimple(snp_array$genotypes, method = "mode") #Imputing the remaining missing values
+maf <- snp_MAF(G)
+G <- G[]
+
+
+colnames(G) <- snp_array$map$marker.ID
+rownames(G) <- snp_array$fam$family.ID
+
+
+#PRS: ----
+df_all_prs <- readRDS("OUTPUT/PRS/rds/all_prs_df.rds")
+df_all_prs$SXS <- df_all_prs$IID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+#Matrix with PRS
+mt_all_prs <- df_all_prs %>% filter (SXS %in% samples_metadata$SXS) %>%  select (contains("Pt")) %>% as.matrix()
+rownames (mt_all_prs) <-  df_all_prs %>% filter (SXS %in% samples_metadata$SXS) %>% pull (SXS) 
+```
+
+Select the samples that were only exposed during early (first 3 months) and the ones that were concived after the famine.
+
+```{r}
+
+samples_metadata_fil <- samples_metadata %>% filter (both_views == 1) %>% filter (Exposure %in% c("Early") | Timeframe_non == "Postfamine" )
+
+```
+
+
+
+Undersampling (due to the reduced number of EE samples that have both types of data)
+```{r}
+
+# samples_ee <- samples_metadata_fil %>% 
+#   filter ( SXS %in% rownames (G) & id %in% colnames (beta_values) & Exposure == "Early") %>% 
+#   pull (SXS)
+# 
+# 
+# set.seed(5)
+# samples_post <- samples_metadata_fil %>%
+#   filter (SXS %in% rownames (mt_all_prs)) %>% 
+#   filter(Timeframe_non == "Postfamine") %>%
+#   pull (SXS) %>% 
+#   sample (size = length (samples_ee)) #Number of EE in PRS samples. 
+# 
+# samples_metadata_fil <- samples_metadata %>% filter (SXS %in% c (samples_ee, samples_post))
+# 
+# samples_metadata_fil_prs <- samples_metadata_fil %>% filter (SXS %in% rownames (mt_all_prs))
+```
+
+
+
+
+```{r}
+path_output <- "OUTPUT/EE_classification2"
+
+n_folds <- 4 #Number of crossvalidation folds
+```
+
+
+## 1.MUVR:
+
+### 1.1 Methylation + SNPs
+
+#### -Preprocessing
+
+Selection of the methylation variables with highest variance
+
+```{r}
+beta_variance <- apply (beta_values, 1, var)
+
+#Select only values with high variance (top 50%)
+betas_fil <- beta_values[ beta_variance >  quantile (beta_variance, 0.50),]
+
+betas_fil <- t(betas_fil[,samples_metadata_fil$id])
+
+```
+
+Selection of SNPs with high maf
+
+```{r}
+
+G_fil <- G[samples_metadata_fil$SXS, which (maf > 0.1)]
+
+```
+
+#### -Model
+
+CV of the RF model. Featre selection is included in the model.
+
+```{r}
+#set seed to have consistent results
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil$target, k = n_folds)
+
+muvr_list <- list()
+rf_list <- list()
+x_test_topvar <- list()
+
+t1 <- Sys.time()
+for (i in 1:n_folds) {
+  
+  y_train_cv <- samples_metadata_fil[-folds[[i]],]$target
+  y_test_cv <- samples_metadata_fil[folds[[i]],]$target
+  
+  
+  
+  ##Genomic data: 
+  #Based on previous G_fil2 and betas_fil2, that were filtered based on variance or maf
+  
+  G_fil_cv_train <- G_fil[ (samples_metadata_fil[-folds[[i]],] %>% pull (SXS)),]
+  G_fil_cv_test <- G_fil[(samples_metadata_fil[folds[[i]],] %>% pull (SXS)), ]
+  
+  x_square <- function (j){
+    chi <- chisq.test(j, y_train_cv)
+    return (chi$p.val)
+  }
+  pval_xsqr <- apply (G_fil_cv_train,2, function(j){chisq.test(j, y_train_cv)$p.val})
+  #Selection of the top 5000 snps that correlate with target. 
+  G_fil_cv_train <-  G_fil_cv_train[, sort(pval_xsqr, index.return = TRUE)$ix[1:2000]]
+  G_fil_cv_test <-  G_fil_cv_test[, sort(pval_xsqr, index.return = TRUE)$ix[1:2000]]
+  
+  ##Methylation data: 
+  
+  #Transpose de matrix and select train and test samples
+  betas_fil_cv_train <- betas_fil[(samples_metadata_fil[-folds[[i]],] 
+                                       %>% pull (id)),]
+  betas_fil_cv_test <- betas_fil[(samples_metadata_fil[folds[[i]], ] 
+                                      %>% pull (id)), ]
+  
+  # Select top variables with lower pval
+  pval_betas <- apply (betas_fil_cv_train,
+                       2,
+                       function (j) { t.test (j ~ y_train_cv)$p.val})
+  betas_fil_cv_train <- betas_fil_cv_train [, sort (pval_betas, index.return = TRUE)$ix[1:2000]]
+  betas_fil_cv_test <- betas_fil_cv_test [, sort (pval_betas, index.return = TRUE)$ix[1:2000]]
+  
+  
+  
+  
+  
+  ###MUVR
+  
+  cl = makeCluster(10)
+  doParallel::registerDoParallel(cl)
+  
+  model_muvr_cv <- MUVR( X = cbind (G_fil_cv_train, betas_fil_cv_train), 
+                         Y = y_train_cv, 
+                         nRep = 10, 
+                         nOuter = 5, 
+                         varRatio = 0.7, 
+                         method = "RF", 
+                         fitness = "AUROC", 
+                         modReturn = TRUE)
+  
+  stopCluster(cl)
+  
+  #Selecting the most important features according to the
+  top_var_cv <- getVIP(model_muvr_cv, model = "mid")$name
+  
+  
+
+  #return models
+  muvr_list[[i]] <-  model_muvr_cv
+  # rf_list[[i]] <- rf_fit_cv
+  x_test_topvar[[i]] <- cbind(G_fil_cv_test, betas_fil_cv_test)[,top_var_cv]
+  
+  #Show time taken
+  Sys.time() - t1
+}
+
+```
+
+Save results
+```{r}
+saveRDS(list (muvr_list, x_test_topvar), file = paste(path_output, "rds","MUVR_Methy_SNPs.rds", sep = "/"))
+```
+
+
+load results
+```{r}
+list_results <- readRDS (paste(path_output, "rds","MUVR_Methy_SNPs.rds", sep = "/"))
+
+muvr_list <- list_results[[1]]
+x_test_topvar <- list_results[[2]]
+```
+
+
+Top variables
+
+```{r}
+top_variables_list <- lapply (x_test_topvar, colnames)
+
+common_top_variables <- Reduce (intersect, top_variables_list )
+print (common_top_variables)
+
+sapply (top_variables_list, length) 
+
+# #Percentage of genomic variables in top variables
+# sapply (top_variables_list, function(x){round (length (x[grep("rs", x)]) * 100/length (x), 2)}) %>% 
+# 
+# #Number of genomic variables in top variables
+# sapply (top_variables_list, function(x){length (x[grep("rs", x)]) }) 
+
+
+#Variables that appear in 3 of the folds
+common_variables <- unique (unlist (top_variables_list))
+common_top_variables <-  common_variables[sapply 
+                                          ( common_variables,
+                                            function(x){
+                                              sum (sapply (top_variables_list, function (y) x %in% y))}) == n_folds-1]
+
+print (common_top_variables)
+# print (top_variables_list)
+
+```
+Number of features in the final model: 325 133 225 269
+variables in n_folds: 4 --> "cg16151651" "cg12062099" "cg25614889" "cg13229363"
+variables in n_folds -1: 11 -->  "cg12002139" "cg10243004" "cg02026801" "cg17851276" "cg10294939" "cg03943115" "cg23029573" "cg05044291" "cg11077225" "cg26348348" "cg20313642"
+
+
+
+#### -Plots
+
+Roc plots of the MUVR models
+
+```{r}
+
+roc_plot_muvr <- ggplot()
+auc_muvr <- c()
+
+for (i in 1:n_folds){
+  
+  
+  
+  # top_var <- muvr_list[[i]]$VIP %>% rownames()
+  # 
+  # var <- cbind( G_fil[(samples_metadata_fil[folds[[i]],] %>% pull (SXS)), ],
+  #                     betas_fil[(samples_metadata_fil[folds[[i]], ] 
+  #                                       %>% pull (id)), ])  %>% colnames
+  # 
+  # new_var <- setdiff (top_var, var)
+  # 
+  # print (new_var)
+  # 
+  # G_fil <- cbind (G_fil, G[rownames(G_fil),new_var] )
+
+  
+  ### MUVR ROC PLOT ###
+  print (i)
+
+  # Definition again of the test variables for the models. 
+  y_test_cv <- samples_metadata_fil[folds[[i]],]$target
+  
+  x_test_cv <- cbind( G[(samples_metadata_fil[folds[[i]],] %>% pull (SXS)), ],
+                    betas_fil[(samples_metadata_fil[folds[[i]], ] 
+                                      %>% pull (id)), ])[, muvr_list[[i]]$VIP %>% rownames()]
+  
+  
+  prediction_model_cv <- predMV(muvr_list[[i]], x_test_cv, model = "mid")
+  
+  roc_data <-  roc(y_test_cv, prediction_model_cv$yPred[,2])
+  
+  roc_plot_muvr <- roc_plot_muvr + geom_path(data = data.frame(x = 1 - roc_data$specificities,
+                                y = roc_data$sensitivities,
+                                Fold = sprintf("%s, auc = %s", i, round(roc_data$auc,3))),
+              aes(x = x, y = y, col = Fold), alpha = 0.8, size = 1.1)  
+
+
+  cm <- caret::confusionMatrix(as.factor(prediction_model_cv$yClass), as.factor(y_test_cv))
+  cm
+  auc_muvr <- c(auc_muvr, roc_data$auc[[1]])
+
+
+
+  print (i)
+}
+
+mean(auc_muvr)#0.5905
+sd(auc_muvr)#0.115
+
+```
+mean auc: 0.5164304
+sd auc: 0.03995974
+
+
+
+```{r}
+
+roc_plot_muvr + labs(x = "1 - Specificity", y = "Sensitivity", title = "ROC Curve") +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", alpha = 0.5) +
+    scale_x_continuous(limits = c(0,1), expand = c(0, 0.01)) +
+    scale_y_continuous(limits = c(0,1), expand = c(0, 0.01)) +
+    theme_bw(base_size = 15)
+
+ggsave ("muvr_Mehty_SNPs_rocplot.png", path = paste (path_output, "rocplots", sep = "/"))
+```
+
+
+
+### 1.2 Methylation + PRS
+
+#### -Preprocessing
+
+Subsample the metadata df to remove only samples that don't have PRS calculated. 
+```{r}
+samples_metadata_fil_prs <- samples_metadata_fil %>% filter (SXS %in% rownames (mt_all_prs))
+
+# 
+# samples_metadata_fil_prs <- samples_metadata %>% filter (id %in% colnames (beta_values),
+#                                                          SXS %in% rownames (mt_all_prs), 
+#                                                          Exposure == "Early" | Timeframe_non == "Postfamine")
+
+```
+
+
+Selection of the methylation variables with highest variance
+```{r}
+beta_variance <- apply (beta_values, 1, var)
+
+#Select only values with high variance (top 50%)
+betas_fil <- beta_values[ beta_variance >  quantile (beta_variance, 0.50),]
+
+betas_fil <- t(betas_fil[,samples_metadata_fil_prs$id])
+
+```
+
+Selection of PRS samples
+```{r}
+mt_prs <- mt_all_prs[samples_metadata_fil_prs$SXS, ]
+
+```
+
+
+
+#### -Model
+
+CV of the RF model. Featre selection is included in the model.
+```{r}
+#set seed to have consistent results
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil_prs$target, k = n_folds)
+
+muvr_list <- list()
+rf_list <- list()
+x_test_topvar <- list()
+
+t1 <- Sys.time()
+for (i in 1:n_folds) {
+  
+  y_train_cv <- samples_metadata_fil_prs[-folds[[i]],]$target
+  y_test_cv <- samples_metadata_fil_prs[folds[[i]],]$target
+  
+
+  ##PRS data: 
+  prs_cv_train <- mt_prs[-folds[[i]],]
+  prs_cv_test <- mt_prs[folds[[i]],]
+  
+  ##Methylation data: 
+  
+  #Transpose de matrix and select train and test samples
+  betas_fil_cv_train <- betas_fil[(samples_metadata_fil_prs[-folds[[i]],] 
+                                       %>% pull (id)),]
+  betas_fil_cv_test <- betas_fil[(samples_metadata_fil_prs[folds[[i]], ] 
+                                      %>% pull (id)), ]
+  
+  # Select top variables with lower pval
+  pval_betas <- apply (betas_fil_cv_train,
+                       2,
+                       function (j) { t.test (j ~ y_train_cv)$p.val})
+  betas_fil_cv_train <- betas_fil_cv_train [, sort (pval_betas, index.return = TRUE)$ix[1:4000]]
+  betas_fil_cv_test <- betas_fil_cv_test [, sort (pval_betas, index.return = TRUE)$ix[1:4000]]
+  
+  
+  
+  
+  print (dim (prs_cv_train))
+  print (dim (betas_fil_cv_train))
+  ###MUVR
+  
+  cl = makeCluster(10)
+  doParallel::registerDoParallel(cl)
+  
+  model_muvr_cv <- MUVR( X = cbind (prs_cv_train, betas_fil_cv_train), 
+                         Y = y_train_cv, 
+                         nRep = 10, 
+                         nOuter = 5, 
+                         varRatio = 0.7, 
+                         method = "RF", 
+                         fitness = "AUROC", 
+                         modReturn = TRUE)
+  
+  stopCluster(cl)
+  
+  #Selecting the most important features according to the
+  top_var_cv <- getVIP(model_muvr_cv, model = "mid")$name
+  
+
+  #return models
+  muvr_list[[i]] <-  model_muvr_cv
+  # rf_list[[i]] <- rf_fit_cv
+  x_test_topvar[[i]] <- cbind(prs_cv_test, betas_fil_cv_test)[,top_var_cv]
+  
+  #Show time taken
+  print (Sys.time() - t1)
+}
+
+```
+
+
+Save results
+```{r}
+saveRDS(list (muvr_list, x_test_topvar), file = paste(path_output, "rds","MUVR_Methy_PRS.rds", sep = "/"))
+```
+
+
+load results
+```{r}
+list_results <- readRDS (paste(path_output, "rds","MUVR_Methy_PRS.rds", sep = "/"))
+
+muvr_list <- list_results[[1]]
+x_test_topvar <- list_results[[2]]
+
+#Fold generation again 
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil_prs$target, k = n_folds)
+```
+
+
+
+
+Number of common variables: 
+```{r}
+top_variables_list <- lapply (x_test_topvar, colnames)
+common_top_variables <- Reduce (intersect, top_variables_list )
+
+print (common_top_variables)
+#intersect (top_variables_list[[1]], top_variables_list[[2]])
+#intersect (intersect (top_variables_list[[1]], top_variables_list[[2]]), top_variables_list[[3]])
+
+
+sapply (top_variables_list, length) 
+
+
+#Variables that appear in 3 of the folds
+common_variables <- unique (unlist (top_variables_list))
+common_top_variables <-  common_variables[sapply 
+                                          ( common_variables,
+                                            function(x){
+                                              sum (sapply (top_variables_list, function (y) x %in% y))}) == 3]
+
+length (common_top_variables)
+common_top_variables
+# top_variables_list
+
+```
+Number of features in the final model: 87  73  50 104
+variables in n_folds: 0 --> 
+variables in n_folds -1: 6 -->   "cg16151651" "cg06636541" "cg10294939" "cg14273027" "cg15234627" "cg13229363"
+
+
+
+#### -Plots
+```{r}
+
+#set seed to have consistent results
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil_prs$target, k = n_folds)
+
+roc_plot_muvr <- ggplot()
+auc_muvr <- c()
+
+for (i in 1:n_folds){
+  
+  ### MUVR ROC PLOT ###
+  
+  
+
+  # Definition again of the test variables for the models. 
+  y_test_cv <- samples_metadata_fil_prs[folds[[i]],]$target
+  
+  x_test_cv <- cbind( mt_prs[folds[[i]],],
+                      betas_fil[folds[[i]], ])[, muvr_list[[i]]$VIP %>% rownames()]
+  
+  
+  prediction_model_cv <- predMV(muvr_list[[i]], x_test_cv, model = "mid")
+  
+  roc_data <-  roc(y_test_cv, prediction_model_cv$yPred[,2])
+  
+  roc_plot_muvr <- roc_plot_muvr + geom_path(data = data.frame(x = 1 - roc_data$specificities,
+                                y = roc_data$sensitivities,
+                                Fold = sprintf("%s, auc = %s", i, round(roc_data$auc,3))),
+              aes(x = x, y = y, col = Fold), alpha = 0.8, size = 1.1)  
+
+
+  cm <- caret::confusionMatrix(as.factor(prediction_model_cv$yClass), as.factor(y_test_cv))
+  cm
+  auc_muvr <- c(auc_muvr, roc_data$auc[[1]])
+
+  print (i)
+  
+}
+```
+
+
+```{r}
+roc_plot_muvr + labs(x = "1 - Specificity", y = "Sensitivity", title = "ROC Curve") +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", alpha = 0.5) +
+    scale_x_continuous(limits = c(0,1), expand = c(0, 0.01)) +
+    scale_y_continuous(limits = c(0,1), expand = c(0, 0.01)) +
+    theme_bw(base_size = 15)
+
+
+mean (auc_muvr)#
+sd (auc_muvr) #
+
+ggsave("muvr_methy_PRS_rocplot.png", path =  paste (path_output, "rocplots", sep = "/"))
+```
+mean auc: 0.6252579
+sd auc: 0.08774822
+
+
+
+
+### 1.3 Metylation
+
+#### -Preprocessing
+
+Selection of the methylation variables with highest variance
+
+```{r}
+beta_variance <- apply (beta_values, 1, var)
+
+#Select only values with high variance (top 50%)
+betas_fil <- beta_values[ beta_variance >  quantile (beta_variance, 0.50),]
+
+betas_fil <- t(betas_fil[,samples_metadata_fil$id])
+
+```
+
+
+
+
+#### -Model
+
+CV of the RF model. Feature selection is included in the model.
+
+```{r}
+#set seed to have consistent results
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil$target, k = n_folds)
+
+muvr_list <- list()
+rf_list <- list()
+x_test_topvar <- list()
+
+t1 <- Sys.time()
+for (i in 1:n_folds) {
+  
+  y_train_cv <- samples_metadata_fil[-folds[[i]],]$target
+  y_test_cv <- samples_metadata_fil[folds[[i]],]$target
+  
+  
+  
+  ##Methylation data: 
+  
+  #Transpose de matrix and select train and test samples
+  betas_fil_cv_train <- betas_fil[(samples_metadata_fil[-folds[[i]],] 
+                                       %>% pull (id)),]
+  betas_fil_cv_test <- betas_fil[(samples_metadata_fil[folds[[i]], ] 
+                                      %>% pull (id)), ]
+  
+  # Select top variables with lower pval
+  pval_betas <- apply (betas_fil_cv_train,
+                       2,
+                       function (j) { t.test (j ~ y_train_cv)$p.val})
+  betas_fil_cv_train <- betas_fil_cv_train [, sort (pval_betas, index.return = TRUE)$ix[1:4000]]
+  betas_fil_cv_test <- betas_fil_cv_test [, sort (pval_betas, index.return = TRUE)$ix[1:4000]]
+  
+  
+  ###MUVR
+  
+  cl = makeCluster(10)
+  doParallel::registerDoParallel(cl)
+  
+  model_muvr_cv <- MUVR( X =  betas_fil_cv_train, 
+                         Y = y_train_cv, 
+                         nRep = 10, 
+                         nOuter = 5, 
+                         varRatio = 0.7, 
+                         method = "RF", 
+                         fitness = "AUROC", 
+                         modReturn = TRUE)
+  
+  stopCluster(cl)
+  
+  #Selecting the most important features according to the
+  top_var_cv <- getVIP(model_muvr_cv, model = "mid")$name
+  
+  
+  #return models
+  muvr_list[[i]] <-  model_muvr_cv
+  # rf_list[[i]] <- rf_fit_cv
+  x_test_topvar[[i]] <-  betas_fil_cv_test[,top_var_cv]
+  
+  #Show time taken
+  Sys.time() - t1
+}
+
+```
+
+
+
+Save results
+```{r}
+saveRDS(list (muvr_list, x_test_topvar), file = paste(path_output, "rds","MUVR_Methy.rds", sep = "/"))
+```
+
+
+
+load results
+```{r}
+list_results <- readRDS (paste(path_output, "rds","MUVR_Methy.rds", sep = "/"))
+
+muvr_list <- list_results[[1]]
+x_test_topvar <- list_results[[2]]
+
+#Fold generation again 
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil$target, k = n_folds)
+```
+
+
+
+Number of common variables: 
+```{r}
+top_variables_list <- lapply (x_test_topvar, colnames)
+common_top_variables <- Reduce (intersect, top_variables_list )
+
+
+sapply (top_variables_list, length) 
+print (common_top_variables)
+
+
+#Variables that appear in 3 of the folds
+common_variables <- unique (unlist (top_variables_list))
+common_top_variables <-  common_variables[sapply 
+                                          ( common_variables,
+                                            function(x){
+                                              sum (sapply (top_variables_list, function (y) x %in% y))}) == n_folds -1]
+
+length (common_top_variables)
+common_top_variables
+# top_variables_list
+
+```
+Number of features in the final model: 110  63  77  76
+variables in n_folds: 1 --> "cg16151651"
+variables in n_folds -1: 6 -->  "cg12002139" "cg14428146" "cg10294939" "cg17851276" "cg23029573" "cg03795847"
+
+
+
+#### -Plots
+
+```{r}
+
+#set seed to have consistent results
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil$target, k = n_folds)
+
+roc_plot_muvr <- ggplot()
+auc_muvr <- c()
+
+for (i in 1:n_folds){
+  
+  ### MUVR ROC PLOT ###
+
+  # Definition again of the test variables for the models. 
+  y_test_cv <- samples_metadata_fil[folds[[i]],]$target
+  x_test_cv <- betas_fil[folds[[i]], ][, muvr_list[[i]]$VIP %>% rownames()]
+  
+  
+  prediction_model_cv <- predMV(muvr_list[[i]], x_test_cv, model = "mid")
+  
+  roc_data <-  roc(y_test_cv, prediction_model_cv$yPred[,2])
+  
+  roc_plot_muvr <- roc_plot_muvr + geom_path(data = data.frame(x = 1 - roc_data$specificities,
+                                y = roc_data$sensitivities,
+                                Fold = sprintf("%s, auc = %s", i, round(roc_data$auc,3))),
+              aes(x = x, y = y, col = Fold), alpha = 0.8, size = 1.1)  
+
+
+  cm <- caret::confusionMatrix(as.factor(prediction_model_cv$yClass), as.factor(y_test_cv))
+  cm
+  auc_muvr <- c(auc_muvr, roc_data$auc[[1]])
+
+
+
+  print (i)
+  
+}
+```
+
+
+```{r}
+roc_plot_muvr + labs(x = "1 - Specificity", y = "Sensitivity", title = "ROC Curve") +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", alpha = 0.5) +
+    scale_x_continuous(limits = c(0,1), expand = c(0, 0.01)) +
+    scale_y_continuous(limits = c(0,1), expand = c(0, 0.01)) +
+    theme_bw(base_size = 15)
+
+
+mean (auc_muvr) #
+sd (auc_muvr)  #
+
+ggsave("muvr_Methy_rocplot.png", path =  paste (path_output, "rocplots", sep = "/"))
+```
+Mean auc: 0.5242532
+sd auc: 0.01503257
+
+
+
+
+### 1.4 Genomic
+
+
+#### -Preprocessing
+
+
+Selection of SNPs with high maf
+
+```{r}
+
+G_fil <- G[samples_metadata_fil$SXS, which (maf > 0.1)]
+
+```
+
+#### -Model
+
+CV of the RF model. Featre selection is included in the model.
+
+```{r}
+#set seed to have consistent results
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil$target, k = n_folds)
+
+muvr_list <- list()
+rf_list <- list()
+x_test_topvar <- list()
+
+t1 <- Sys.time()
+for (i in 1:n_folds) {
+  
+  y_train_cv <- samples_metadata_fil[-folds[[i]],]$target
+  y_test_cv <- samples_metadata_fil[folds[[i]],]$target
+  
+  
+  
+  ##Genomic data: 
+  #Based on previous G_fil2 and betas_fil2, that were filtered based on variance or maf
+  
+  G_fil_cv_train <- G_fil[ (samples_metadata_fil[-folds[[i]],] %>% pull (SXS)),]
+  G_fil_cv_test <- G_fil[(samples_metadata_fil[folds[[i]],] %>% pull (SXS)), ]
+  
+  x_square <- function (j){
+    chi <- chisq.test(j, y_train_cv)
+    return (chi$p.val)
+  }
+  pval_xsqr <- apply (G_fil_cv_train,2, function(j){chisq.test(j, y_train_cv)$p.val})
+  #Selection of the top 5000 snps that correlate with target. 
+  G_fil_cv_train <-  G_fil_cv_train[, sort(pval_xsqr, index.return = TRUE)$ix[1:4000]]
+  G_fil_cv_test <-  G_fil_cv_test[, sort(pval_xsqr, index.return = TRUE)$ix[1:4000]]
+  
+
+  
+  
+  
+  
+  
+  ###MUVR
+  
+  cl = makeCluster(10)
+  doParallel::registerDoParallel(cl)
+  
+  model_muvr_cv <- MUVR( X = G_fil_cv_train, 
+                         Y = y_train_cv, 
+                         nRep = 10, 
+                         nOuter = 5, 
+                         varRatio = 0.7, 
+                         method = "RF", 
+                         fitness = "AUROC", 
+                         modReturn = TRUE)
+  
+  stopCluster(cl)
+  
+  #Selecting the most important features according to the
+  top_var_cv <- getVIP(model_muvr_cv, model = "mid")$name
+  
+  
+  
+  
+
+  #return models
+  muvr_list[[i]] <-  model_muvr_cv
+  # rf_list[[i]] <- rf_fit_cv
+  x_test_topvar[[i]] <- G_fil_cv_test[,top_var_cv]
+  
+  #Show time taken
+  Sys.time() - t1
+}
+
+```
+
+Save results
+
+```{r}
+saveRDS(list (muvr_list, x_test_topvar), file = paste(path_output, "rds","MUVR_SNPs.rds", sep = "/"))
+```
+
+load results
+```{r}
+list_results <- readRDS (paste(path_output, "rds","MUVR_SNPs.rds", sep = "/"))
+
+muvr_list <- list_results[[1]]
+x_test_topvar <- list_results[[2]]
+
+#Fold generation again 
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil$target, k = n_folds)
+```
+
+
+Top variables
+```{r}
+top_variables_list <- lapply (x_test_topvar, colnames)
+
+common_top_variables <- Reduce (intersect, top_variables_list )
+print (common_top_variables)
+
+sapply (top_variables_list, length) 
+
+
+
+#Variables that appear in 3 of the folds
+common_variables <- unique (unlist (top_variables_list))
+common_top_variables <-  common_variables[sapply 
+                                          ( common_variables,
+                                            function(x){
+                                              sum (sapply (top_variables_list, function (y) x %in% y))}) == n_folds -1]
+
+print (common_top_variables)
+
+# print (top_variables_list)
+
+```
+Many features selected in each model (316 316 316 316). 8 features selected in all folds and 41 selected in 3 of them. 
+
+
+#### -Plots 
+Roc plots of the MUVR models
+```{r}
+#set seed to have consistent results
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil$target, k = n_folds)
+
+roc_plot_muvr <- ggplot()
+auc_muvr <- c()
+
+for (i in 1:n_folds){
+  
+  ### MUVR ROC PLOT ###
+
+  # Definition again of the test variables for the models. 
+  y_test_cv <- samples_metadata_fil[folds[[i]],]$target
+  
+  x_test_cv <- G_fil[(samples_metadata_fil[folds[[i]],] %>% pull (SXS)), ][, muvr_list[[i]]$VIP %>% rownames()]
+  
+  
+  prediction_model_cv <- predMV(muvr_list[[i]], x_test_cv, model = "mid")
+  
+  roc_data <-  roc(y_test_cv, prediction_model_cv$yPred[,2])
+  
+  roc_plot_muvr <- roc_plot_muvr + geom_path(data = data.frame(x = 1 - roc_data$specificities,
+                                y = roc_data$sensitivities,
+                                Fold = sprintf("%s, auc = %s", i, round(roc_data$auc,3))),
+              aes(x = x, y = y, col = Fold), alpha = 0.8, size = 1.1)  
+
+
+  cm <- caret::confusionMatrix(as.factor(prediction_model_cv$yClass), as.factor(y_test_cv))
+  cm
+  auc_muvr <- c(auc_muvr, roc_data$auc[[1]])
+
+
+
+  print (i)
+}
+
+mean(auc_muvr)#0.5486111
+sd(auc_muvr)#0.1186667
+
+```
+mean auc: 0.5708514
+sd auc: 0.04706824
+
+
+
+```{r}
+
+roc_plot_muvr + labs(x = "1 - Specificity", y = "Sensitivity", title = "ROC Curve") +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", alpha = 0.5) +
+    scale_x_continuous(limits = c(0,1), expand = c(0, 0.01)) +
+    scale_y_continuous(limits = c(0,1), expand = c(0, 0.01)) +
+    theme_bw(base_size = 15)
+
+ggsave("muvr_SNPs_rocplot.png", path =  paste (path_output, "rocplots", sep = "/"))
+
+```
+
+
+
+### 1.5 PRS
+
+#### -Preprocessing
+
+
+Subsample the metadata df to remove only samples that don't have PRS calculated. 
+```{r}
+samples_metadata_fil_prs <- samples_metadata_fil %>% filter (SXS %in% rownames (mt_all_prs))
+```
+
+Selection of PRS samples
+```{r}
+mt_prs <- mt_all_prs[samples_metadata_fil_prs$SXS, ]
+```
+
+
+
+#### -Model
+
+CV of the RF model. Feature selection is included in the model.
+
+```{r}
+#set seed to have consistent results
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil_prs$target, k = n_folds)
+
+muvr_list <- list()
+rf_list <- list()
+x_test_topvar <- list()
+
+t1 <- Sys.time()
+for (i in 1:n_folds) {
+  
+  y_train_cv <- samples_metadata_fil_prs[-folds[[i]],]$target
+  y_test_cv <- samples_metadata_fil_prs[folds[[i]],]$target
+  
+  
+  
+
+  ##PRS data: 
+  prs_cv_train <- mt_prs[-folds[[i]],]
+  prs_cv_test <- mt_prs[folds[[i]],]
+
+  
+  
+  
+  
+  ###MUVR
+  
+  cl = makeCluster(10)
+  doParallel::registerDoParallel(cl)
+  
+  model_muvr_cv <- MUVR( X = prs_cv_train, 
+                         Y = y_train_cv, 
+                         nRep = 10, 
+                         nOuter = 5, 
+                         varRatio = 0.7, 
+                         method = "RF", 
+                         fitness = "AUROC", 
+                         modReturn = TRUE)
+  
+  stopCluster(cl)
+  
+  #Selecting the most important features according to the
+  top_var_cv <- getVIP(model_muvr_cv, model = "mid")$name
+  
+  
+  
+
+  #return models
+  muvr_list[[i]] <-  model_muvr_cv
+  # rf_list[[i]] <- rf_fit_cv
+  x_test_topvar[[i]] <- prs_cv_test[,top_var_cv]
+  
+  #Show time taken
+  Sys.time() - t1
+}
+
+```
+
+
+Save results
+```{r}
+saveRDS(list (muvr_list, x_test_topvar), file = paste(path_output, "rds","MUVR_PRS.rds", sep = "/"))
+```
+
+
+load results
+```{r}
+list_results <- readRDS (paste(path_output, "rds","MUVR_PRS.rds", sep = "/"))
+
+muvr_list <- list_results[[1]]
+x_test_topvar <- list_results[[2]]
+
+#Fold generation again 
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil_prs$target, k = n_folds)
+```
+
+
+
+Number of common variables: 
+
+```{r}
+top_variables_list <- lapply (x_test_topvar, colnames)
+common_top_variables <- Reduce (intersect, top_variables_list )
+
+
+#intersect (top_variables_list[[1]], top_variables_list[[2]])
+#intersect (intersect (top_variables_list[[1]], top_variables_list[[2]]), top_variables_list[[3]])
+
+
+sapply (top_variables_list, length) 
+common_top_variables
+
+#Variables that appear in 3 of the folds
+common_variables <- unique (unlist (top_variables_list))
+common_top_variables <-  common_variables[sapply 
+                                          ( common_variables,
+                                            function(x){
+                                              sum (sapply (top_variables_list, function (y) x %in% y))}) == n_folds -1]
+
+length (common_top_variables) 
+mean(sapply (top_variables_list, length))#21.6
+common_top_variables
+# top_variables_list
+
+```
+Number of variables in each fold: 19 20 20 17
+All folds: 0 -->  
+N-1 folds: 6 --> 
+
+[1] "Pt_0.001-Bipolar_and_major_depression_status"               "Pt_0.5-Anxiety_disorder_factor_score"                      
+[3] "Pt_0.0001-Current_tobacco_smoking"                          "Pt_0.1-Anxiety_disorder_factor_score"                      
+[5] "Pt_0.0001-Anxiety_disorder_factor_score"                    "Pt_0.0001-Non-cancer_illness_code_self-reported_depression"
+
+
+
+#### -Plots
+
+```{r}
+
+#set seed to have consistent results
+set.seed(5)
+folds <- caret::createFolds (samples_metadata_fil_prs$target, k = n_folds)
+
+roc_plot_muvr <- ggplot()
+auc_muvr <- c()
+
+for (i in 1:n_folds){
+  
+  ### MUVR ROC PLOT ###
+
+  # Definition again of the test variables for the models. 
+  y_test_cv <- samples_metadata_fil_prs[folds[[i]],]$target
+  x_test_cv <- mt_prs[folds[[i]],][, muvr_list[[i]]$VIP %>% rownames()]
+  
+  
+  prediction_model_cv <- predMV(muvr_list[[i]], x_test_cv, model = "mid")
+  
+  roc_data <-  roc(y_test_cv, prediction_model_cv$yPred[,2])
+  
+  roc_plot_muvr <- roc_plot_muvr + geom_path(data = data.frame(x = 1 - roc_data$specificities,
+                                y = roc_data$sensitivities,
+                                Fold = sprintf("%s, auc = %s", i, round(roc_data$auc,3))),
+              aes(x = x, y = y, col = Fold), alpha = 0.8, size = 1.1)  
+
+
+  cm <- caret::confusionMatrix(as.factor(prediction_model_cv$yClass), as.factor(y_test_cv))
+  cm
+  auc_muvr <- c(auc_muvr, roc_data$auc[[1]])
+  
+  print (i)
+  print (cm)
+  
+  
+}
+```
+
+
+```{r}
+roc_plot_muvr + labs(x = "1 - Specificity", y = "Sensitivity", title = "ROC Curve") +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", alpha = 0.5) +
+    scale_x_continuous(limits = c(0,1), expand = c(0, 0.01)) +
+    scale_y_continuous(limits = c(0,1), expand = c(0, 0.01)) +
+    theme_bw(base_size = 15)
+
+
+mean (auc_muvr)#
+sd (auc_muvr) #
+
+ggsave("muvr_PRS_rocplot.png", path =  paste (path_output, "rocplots", sep = "/"))
+```
+
+mean auc: 0.5850794
+sd auc: 0.03522427
+
+
+
+
+```{r}
+print (sessionInfo())
+```
+
+
+
+

@@ -1,0 +1,382 @@
+---
+title: "Methylation_preprocessing"
+author: "Miguel Parra"
+date: '2023-04-11'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Libraries}
+library ("tidyverse")
+library ("minfi")
+library ("shinyMethyl")
+library ("ggpubr")
+library ("wateRmelon")
+library ("umap")
+
+```
+
+```{r Setup}
+
+rdsDir = "OUTPUT/methylation_preprocessing/rdsDir"
+#dir.create(rdsDir)
+
+qcplots_dir = "OUTPUT/methylation_preprocessing/plots_qc"
+#dir.create (qcplots_dir)
+
+```
+
+
+
+Import the methylation data
+
+```{r}
+rgset = readRDS("./DATA/methylation/rgset.Rds") #read.metharray.exp performed by Andrew's preprocessing. 
+
+gset_raw = preprocessRaw(rgset) #No normalization. Transformation of the Red/Green channels into methylation signal. 
+gmset_raw = mapToGenome(gset_raw)
+
+samples_metadata = read_delim( file = "DATA/methylation/samplesheet_annotated_methylation.csv", delim = ";")
+samples_metadata = samples_metadata %>% mutate (id = paste (Slide, Array, sep = "_"))
+
+```
+
+```{r}
+data.frame (getQC( gmset_raw), pData (gmset_raw)) %>% 
+  ggplot (aes (x = uMed, y = mMed)) + 
+    geom_point(aes (col = as.factor(Slide))) + 
+    theme_bw()
+```
+
+There are 7 outliers that seem to have lower mean signals. 
+
+```{r medsig_distance}
+
+rgset_medI = data.frame (getQC(gmset_raw), pData(gmset_raw))
+
+rgset_medI = rgset_medI %>% mutate (dist_medI = sqrt ((uMed**2) + (mMed**2) ))
+
+```
+
+```{r}
+dist_medI_16 = rgset_medI %>% 
+  group_by(Slide) %>% 
+  summarize (dist_medI < 16) %>% 
+  table() %>% as.data.frame.matrix()
+dist_medI_16$fraction = dist_medI_16[,2] / dist_medI_16[,1]
+
+#Samples to discard
+outlier_slides = dist_medI_16 %>% filter (fraction > 0.3) %>% rownames()
+
+#Outliar annoation: 
+rgset_medI$QC <- "Pass" 
+rgset_medI$QC[rgset_medI$Slide %in% outlier_slides] <- "Slide Failure"
+rgset_medI$QC[rgset_medI$dist_medI<14] <- "Sample Failure"
+
+
+
+ggplot(rgset_medI, aes(x = as.factor(Slide), y = dist_medI)) +
+  geom_point(aes (col = QC)) +
+  theme_bw() +
+  xlab("Slide") +
+  theme(axis.text.x = element_text(angle = 90), 
+        legend.position = "bottom")
+
+ggsave(filename = "medI_Slide.png", path = qcplots_dir, width = 8, height = 4)
+
+
+
+ggplot(rgset_medI, aes(x = uMed, y = mMed)) +
+  geom_point(aes(col = QC)) +
+  labs(title = "Median signal intensity",
+       y = "Methylated",
+       x = "Unmethylated") +
+  theme_bw() +
+  theme(legend.pos = "bottom")
+
+ggsave(filename = "medI.png", path = qcplots_dir, width = 7, height = 4)
+
+plotQC(getQC (gmset_raw))
+
+```
+Samples with medI lower than 14 are discarded. Slices with mea
+
+
+```{r}
+table(rgset_medI$Exposure, rgset_medI$GWAS_data)
+
+```
+A big fraction of the early stage exposure do not pass the QC. 
+
+
+
+```{r shinymethyl}
+rgset_summarized <- shinySummarize(rgset)
+runShinyMethyl(rgset_summarized)
+```
+
+
+#Final sample selection
+```{r}
+pData(gmset_raw) = DataFrame(rgset_medI)
+gmset_qc = gmset_raw[,pData(gmset_raw)$QC == "Pass"]
+saveRDS(gmset_qc, file = "OUTPUT/methylation_preprocessing/rdsDir/gmset_qc.Rds")
+
+
+pData(rgset) = DataFrame(rgset_medI) 
+rgset_qc = rgset[,pData(rgset)$QC == "Pass"]
+saveRDS(rgset_qc, file = file.path(rdsDir, "rgset_qc.Rds"))
+
+```
+
+
+
+```{r m_values: }
+
+mval <- getM(gmset_qc)
+
+
+# Remove NA and missing values... 
+na_mval <- which(is.na(mval), arr.ind = T)
+mval_nona <- mval[-na_mval[,1],]
+mval_cleaned <- mval_nona[- which(is.infinite(mval_nona), arr.ind = TRUE)[,1] ,]
+
+```
+
+
+```{r PCA}
+
+mval_dm <- mval_cleaned-rowMeans(mval_cleaned)
+mval_svd <- svd(t(mval_dm))
+
+data.frame(PC1 = mval_svd$u[,1],
+           PC2 = mval_svd$u[,2],
+           Sex = as.factor(pData(gmset_qc)$Sex)) %>%
+  ggplot(aes(x = PC1, y = PC2, col = Sex)) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.pos = "bottom")
+
+```
+
+
+
+```{r sex prediction}
+sex_pred = getSex(gmset_qc)
+sex_pred$sex = pData(gmset_qc)$Sex
+
+sex_pred = as.data.frame (sex_pred)
+sex_pred = sex_pred %>%  mutate (predicted_sex = ifelse (predictedSex == "F", 2, 1))
+
+sex_pred$agreement = sex_pred$sex  + sex_pred$predicted_sex 
+
+incorrect_sex_samples = sex_pred %>% filter (agreement == 3) %>% rownames()
+
+data.frame(PC1 = mval_svd$u[,1],
+           PC2 = mval_svd$u[,2],
+           #less_than16 = as.factor(rgset_medI %>% filter (QC == "Pass") %>% mutate (medI_less_16 = dist_medI < 16) %>% pull(medI_less_16))
+           Sex = as.factor(sex_pred$agreement)
+           ) %>%
+  ggplot(aes(x = PC1, y = PC2, col = Sex)) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.pos = "bottom")
+
+rgset_medI %>% filter (QC == "Pass") %>% ggplot(aes(x = as.factor(Slide), y = dist_medI, col = as.factor(sex_pred$agreement) )) +
+  geom_point() +
+  theme_bw() +
+  xlab("Slide") +
+  theme(axis.text.x = element_text(angle = 90), 
+        legend.position = "bottom")
+  
+
+```
+
+I does not seem that the samples that have a different sex than the predicted are outliers. 
+
+n
+
+
+#Normalization
+
+```{r Normalization}
+
+rgset_qc = readRDS(file = "OUTPUT/methylation_preprocessing/rdsDir/rgset_qc.Rds")
+grset = preprocessFunnorm(rgset_qc) 
+
+saveRDS(grset , file = file.path(rdsDir, "grset_normalized.Rds"))
+
+```
+ 
+
+get M and Beta values: 
+
+```{r}
+m_values = getM(grset)
+beta_values = getBeta(grset)
+```
+
+
+Blood cells estimation
+```{r}
+library(FlowSorted.Blood.450k)
+cell_estimate = estimateCellCounts(rgset_qc, referencePlatform = "IlluminaHumanMethylation450k")
+
+saveRDS(cell_estimate, file = "OUTPUT/methylation_preprocessing/rdsDir/cell_estimate.rds")
+
+cell_estimate_df = cell_estimate %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "array") %>%
+  mutate (exposure = pData(rgset_qc)$Exposure, timeframe = pData(rgset_qc)$Timeframe_non) %>% 
+  pivot_longer(cols = !c("array", "exposure", "timeframe"), names_to = "cell", values_to = "relative_abundance") 
+
+cell_distribution_exposure = cell_estimate_df %>%
+  ggplot(aes (x = cell, y = relative_abundance)) + 
+  geom_boxplot(aes(fill = exposure )) + 
+  theme_bw() +
+  labs (x = "Cell type", y = "Relative abundance" , title = "Exposure")
+
+cell_distribution_timeframe = cell_estimate_df %>%
+  ggplot(aes (x = cell, y = relative_abundance)) + 
+  geom_boxplot(aes(fill = timeframe )) + 
+  theme_bw() +
+  labs (x = "Cell type", y = "Relative abundance" , title = "Timeframe")
+
+
+ggarrange(cell_distribution_timeframe, cell_distribution_exposure, nrow = 2)
+
+ggsave (filename = "Blood_cells_distribution.png", path = qcplots_dir, width = 7, height = 10)
+
+
+```
+
+
+Age prediction: 
+```{r}
+
+age_estimate = agep(beta_values, method = "all")
+
+age_estimate_df = age_estimate %>%
+  dplyr::select (-contains ("missing")) %>%
+  mutate (Age = pData(rgset_qc)$Age) %>% 
+  pivot_longer (cols = !Age, names_to = "Method", values_to = "Age_prediction" )
+
+
+age_estimate_df %>% ggplot(aes (x = Age, y = Age_prediction)) +
+  geom_point() + 
+  facet_grid( ~ Method)
+
+#Skinblood age predictions is the one that correlates better with the final result.
+#There are two outlieas that are predicted to have way lower age...
+
+#Outlier identification. 
+age_outliers = age_estimate %>% filter (skinblood.skinblood.age < 20) %>% rownames()
+#Outliers: "9721366104_R03C01" "9721367072_R02C01"
+
+
+```
+
+Even though there is a correlation between real age and predicted age, there is not big separation between the samples. The age differences are very small, specially between different famine exposure stages. 
+
+
+
+
+SNP probes deletion. 
+
+SNPs can affect the hybridization of the oligos with the probes, adulterating the signal.
+```{r}
+
+grset_noSNPs = dropLociWithSnps(grset)
+saveRDS(grset_noSNPs , file = file.path(rdsDir, "grset_normalized_noSNPs.Rds"))
+
+m_values = getM(grset_noSNPs)
+beta_values = getBeta(grset_noSNPs)
+
+```
+
+```{r pca beta-values}
+beta_svd <- svd(t(beta_values))
+data.frame(PC1 = beta_svd$u[,1],
+           PC2 = beta_svd$u[,2],
+           Sex = as.factor(pData(grset_noSNPs)$Sex), 
+           Exposure = pData(grset_noSNPs)$Exposure) %>%
+  ggplot(aes(x = PC1, y = PC2, col = Sex)) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.pos = "bottom")
+## Still there are few samples that go to the opposed sex. 
+```
+
+```{r pca M-values}
+
+# Remove NA and missing values... 
+
+mval_cleaned <- m_values[- which(is.infinite(m_values), arr.ind = TRUE)[,1] ,]
+
+mval_dm <- mval_cleaned-rowMeans(mval_cleaned)
+mval_svd <- svd(t(mval_dm))
+
+data.frame(PC1 = mval_svd$u[,1],
+           PC2 = mval_svd$u[,2],
+           Sex = as.factor(pData(grset_noSNPs)$Sex)) %>%
+  ggplot(aes(x = PC1, y = PC2, col = Sex)) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.pos = "bottom")
+```
+Both PCAs are very similar. 
+
+
+
+
+Selection of the sex chromosomes
+```{r}
+granges = rowRanges(grset)
+
+xy_probes = granges[which(seqnames(granges) == "chrX" | seqnames (granges) == "chrY")]@ranges@NAMES
+
+autosomal_probes = setdiff(rownames(grset_noSNPs), xy_probes)
+
+grset_noSNPs_noSex = grset_noSNPs[autosomal_probes, ]
+
+saveRDS(grset_noSNPs_noSex, "OUTPUT/methylation_preprocessing/rdsDir/grset_normalized_noSNPs_noSex.Rds")
+
+m_values = getM(grset_noSNPs_noSex)
+beta_values = getBeta(grset_noSNPs_noSex)
+
+```
+
+
+
+
+```{r pca no sex-chromomes probes}
+
+beta_svd <- svd(t(beta_values))
+
+data.frame(PC1 = beta_svd$u[,1],
+           PC2 = beta_svd$u[,2],
+           Sex = as.factor(pData(grset_noSNPs_noSex)$Sex), 
+           Exposure = pData(grset_noSNPs)$Exposure) %>%
+  ggplot(aes(x = PC1, y = PC2, col = Sex)) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.pos = "bottom")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,269 @@
+---
+title: "tsne_data"
+author: "Miguel Parra"
+date: '2023-07-04'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Set up
+
+```{r libraries}
+
+library (tidyverse)
+library (tsne)
+library (minfi)
+library (janitor)
+
+```
+
+```{r}
+dir_output <- file.path("OUTPUT", "tsne_data")
+```
+
+
+
+
+Import data:
+
+```{r}
+
+#Metadata: ----
+samples_metadata <- readRDS("OUTPUT/feature_selection/rds/samples_metadata.rds")
+
+
+#Methylation data: ----
+grset <- readRDS("OUTPUT/methylation_preprocessing/rdsDir/grset_normalized_noSNPs_noSex.Rds")
+beta_values <- getBeta (grset)
+mval <- getM(grset)
+
+
+#Genomic data: ----
+snp_array <- readRDS("OUTPUT/genomic_preprocessing/rdsDir/bigSNPr_prepro.rds")
+
+G <- snp_fastImputeSimple(snp_array$genotypes, method = "mode") #Imputing the remaining missing values
+maf <- snp_MAF(G)
+G <- G[]
+
+
+colnames(G) <- snp_array$map$marker.ID
+rownames(G) <- snp_array$fam$family.ID
+
+
+#PRS: ----
+df_all_prs <- readRDS("OUTPUT/PRS/rds/all_prs_df.rds")
+df_all_prs$SXS <- df_all_prs$IID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+#Matrix with PRS
+mt_all_prs <- df_all_prs %>% filter (SXS %in% samples_metadata$SXS) %>%  select (contains("Pt")) %>% as.matrix()
+rownames (mt_all_prs) <-  df_all_prs %>% filter (SXS %in% samples_metadata$SXS) %>% pull (SXS) 
+
+```
+
+
+
+## TSNE: 
+
+### SNPs data
+```{r}
+set.seed(5)
+tsne_G<- Rtsne (G)
+
+tsne_G$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., SXS = snp_array$fam$family.ID ) %>% 
+  left_join(., samples_metadata %>% select (SXS, Exposure)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = Exposure)) + 
+  geom_point() + 
+  labs (color = "Exposition", title = "SNPs") +
+  theme_bw(base_size = 15)
+
+
+ggsave (filename = "tsne_SNPs_Exposition.png", path = dir_output, width = 8, height = 6)
+```
+
+
+
+
+
+### Methylation: 
+
+Betas
+```{r}
+
+set.seed(5)
+tsne_beta<- Rtsne (t(beta_values))
+
+# Sex
+tsne_beta$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., id = colnames(beta_values) ) %>% 
+  left_join(., samples_metadata %>% select (id, Exposure, Timeframe_non, Sex, Array)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = as.factor(Sex))) + 
+  geom_point() + 
+  labs (color = "Sex", title = "Betas methylation data") +
+  theme_bw(base_size = 15)
+
+ggsave (filename = "tsne_beta_Sex.png", path = dir_output, width = 8, height = 6)
+
+
+# Exposition
+tsne_beta$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., id = colnames(beta_values) ) %>% 
+  left_join(., samples_metadata %>% select (id, Exposure, Timeframe_non, Sex, Array)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = Exposure)) + 
+  geom_point() + 
+  labs (color = "Famine \nexposure", title = "Betas methylation data") +
+  theme_bw(base_size = 15)
+
+ggsave (filename = "tsne_beta_Exposition.png", path = dir_output, width = 8, height = 6)
+
+
+
+
+# Array
+tsne_beta$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., id = colnames(beta_values) ) %>% 
+  left_join(., samples_metadata %>% select (id, Exposure, Timeframe_non, Sex, Array)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = Array)) + 
+  geom_point() + 
+  labs (color = "Array", title = "Betas methylation data") +
+  theme_bw(base_size = 15)
+
+ggsave (filename = "tsne_beta_Array.png", path = dir_output, width = 8, height = 6)
+
+```
+
+
+mval: 
+```{r}
+
+#Remove probes with infinite values:
+
+if (sum(is.infinite(mval)) != 0){ 
+  mval <- mval[- which(is.infinite(mval), arr.ind = TRUE)[,1] ,]
+  }
+
+set.seed(5)
+tsne_mval<- Rtsne (t(mval))
+
+# Sex
+tsne_mval$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., id = colnames(beta_values) ) %>% 
+  left_join(., samples_metadata %>% select (id, Exposure, Timeframe_non, Sex, Array)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = as.factor(Sex))) + 
+  geom_point() + 
+  labs (color = "Sex", title = "M values") +
+  theme_bw(base_size = 15)
+
+ggsave (filename = "tsne_mval_Sex.png", path = dir_output, width = 8, height = 6)
+
+
+# Exposition
+tsne_mval$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., id = colnames(beta_values) ) %>% 
+  left_join(., samples_metadata %>% select (id, Exposure, Timeframe_non, Sex, Array)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = Exposure)) + 
+  geom_point() + 
+  labs (color = "Famine \nexposure", title = "M values") +
+  theme_bw(base_size = 15)
+
+ggsave (filename = "tsne_mval_Exposition.png", path = dir_output, width = 8, height = 6)
+
+
+
+# Array
+tsne_mval$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., id = colnames(beta_values) ) %>% 
+  left_join(., samples_metadata %>% select (id, Exposure, Timeframe_non, Sex, Array)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = Array)) + 
+  geom_point() + 
+  labs (color = "Array", title = "M values") +
+  theme_bw(base_size = 15)
+
+ggsave (filename = "tsne_mval_Array.png", path = dir_output, width = 8, height = 6)
+
+```
+
+
+
+### PRS
+
+```{r}
+set.seed(5)
+tsne_prs<- Rtsne (mt_all_prs)
+
+tsne_prs$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., SXS = rownames(mt_all_prs) ) %>% 
+  left_join(., samples_metadata %>% select (SXS, Exposure)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = Exposure)) + 
+  geom_point() + 
+  labs (color = "Exposition", title = "PRS") +
+  theme_bw(base_size = 15) 
+
+ggsave (filename = "tsne_prs_Exposure.png", path = dir_output, width = 8, height = 6)
+
+
+tsne_prs$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., SXS = rownames(mt_all_prs) ) %>% 
+  left_join(., samples_metadata %>% select (SXS, Exposure)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = Exposure)) + 
+  geom_point() + 
+  labs (color = "Exposition", title = "PRS") +
+  theme_bw(base_size = 15) + 
+  theme(legend.position = "bottom")
+
+ggsave (filename = "tsne_prs_Exposure.pdf", path = dir_output, width = 8, height = 6)
+
+```
+
+
+
+
+## Test
+
+```{r}
+# Array
+tsne_beta$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., id = colnames(beta_values) ) %>% 
+  left_join(., samples_metadata %>% select (id, Exposure, Timeframe_non, Sex, Array)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = Array)) + 
+  geom_point(alpha =0.2) + 
+  geom_point (data = . %>% filter (Array == "R06C02"))+
+  labs (color = "Array", title = "Betas methylation data") +
+  theme_bw(base_size = 15)
+
+
+# Array
+tsne_beta$Y %>% as.data.frame() %>% 
+  dplyr::rename("DIM1" = V1, "DIM2" = V2) %>%
+  cbind (., id = colnames(beta_values) ) %>% 
+  left_join(., samples_metadata %>% select (id, Exposure, Timeframe_non, Sex, Array)) %>% 
+  ggplot (aes (x = DIM1, y = DIM2, color = Array)) + 
+  geom_point(alpha =0.2) + 
+  geom_point (data = . %>% filter (Array == "R06C01"))+
+  labs (color = "Array", title = "Betas methylation data") +
+  theme_bw(base_size = 15)
+
+
+
+```
+
+
+
+
+
+
+
+

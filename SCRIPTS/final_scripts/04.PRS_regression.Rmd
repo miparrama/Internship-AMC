@@ -1,0 +1,1988 @@
+---
+title: "PRS_regresion"
+output: html_document
+date: '2023-05-17'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+
+Import Libraries. 
+```{r, results = "hide"}
+library ("tidyverse")
+library ("ggpubr")
+library ("DescTools")
+library ("MUVR")
+
+```
+
+## Reading Data
+
+Import metadata
+```{r}
+#Metadata: 
+samples_metadata <- readRDS("OUTPUT/feature_selection/rds/samples_metadata.rds")
+samples_metadata <- samples_metadata %>% mutate (group = ifelse (Exposure == "Non", ifelse (Timeframe_non == "Postfamine", "Post", "Pre"), Exposure))
+
+
+#Covariates (PCs)
+pcs <- read_table("../Miguel_PRS/imputed_dedup.covariate")
+pcs$SXS <- pcs$IID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+pcs <- inner_join((samples_metadata %>% dplyr::select ("SXS", "SampleID", "Exposure", "Timeframe_non", "both_views")), pcs)
+  
+```
+
+
+
+Reading all PRS scores and saving them into one df: 
+```{r}
+#Folder with the PRS results...
+folder_prs <- "../Miguel_PRS/results/"
+
+files_prs <- list.files(path = folder_prs,
+                        pattern = "*.all_score",
+                        recursive = TRUE)
+
+#verion in wide format
+
+list_df <- lapply (files_prs, function (file){
+  basename <- basename (file) %>% strsplit (., ".", fixed = TRUE)
+  basename <- basename[[1]][1]
+  
+  prs_df <- read_table(paste0(folder_prs, file))
+  colnames (prs_df) <- paste0 (colnames (prs_df), "-", basename)
+  return (prs_df)
+})
+
+df_all_prs <- purrr::reduce(list_df, cbind)
+colnames (df_all_prs)[1:2] <- c("FID", "IID")
+df_all_prs <- df_all_prs %>% select (-contains ("ID-"))
+
+
+df_all_prs$SXS <- df_all_prs$IID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+saveRDS(df_all_prs, "OUTPUT/PRS/rds/all_prs_df.rds")
+
+
+
+# #version in long format
+list_df <- lapply (files_prs, function(file){
+  basename <- basename(file) %>% strsplit(., ".", fixed = TRUE)
+  basename <- basename [[1]][1]
+
+  prs_df <- read_table(paste0(folder_prs, file)) %>%
+    pivot_longer(cols = contains("Pt"),
+                 names_to = "thresholds",
+                 values_to = paste0 ("PRS_", basename))
+  # colnames (prs_df) <- paste0(colnames(prs_df),"-", basename)
+  return (prs_df)
+})
+
+df_all_prs <- purrr::reduce(list_df, left_join)
+
+saveRDS(df_all_prs, "OUTPUT/PRS/rds/all_prs_df_long.rds")
+```
+
+
+
+## Postfamine controls 
+
+### BMI
+
+
+Definition of the trait for which the regression is calculated. 
+```{r}
+trait <- "bmi"
+```
+
+Loading the scores and a creating a df with the metadata of the available patients
+```{r, results = "hide"}
+prs <- read_table("../Miguel_PRS/results/Body_Mass_Index.fixed-rsIDs.QC/Body_Mass_Index.fixed-rsIDs.QC.PRSice.all_score")
+
+
+
+
+
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", trait, "both_views")), prs) %>% left_join(., pcs)
+```
+
+Calculation of the null linear model with the covariates:
+```{r}
+null_model <- lm (paste0(trait, "~."), data =  (prs_df %>% filter (Timeframe_non == "Postfamine") %>%  select(contains ("PC"), trait)))
+null_r2 <- summary (null_model)$r.squared
+```
+
+
+
+```{r, warning = FALSE}
+thresholds <- prs %>% select (contains ("Pt")) %>% colnames()
+
+R_adj_thr <- c()
+pval_thr <- c()
+
+R_adj_null_thr <- c()
+pval_nul_thr <- c()
+
+#Compute the regresion for all the thresholds
+for (i in thresholds) {
+  
+  model <- lm (paste (trait, "~", i[[1]]), data = prs_df %>% filter (Timeframe_non == "Postfamine"))
+  
+  #model with covariates
+  model_cov <- lm (paste(trait, "~ ."), data = (prs_df %>% filter (Timeframe_non == "Postfamine") %>%  select(contains ("PC"), i, trait)))
+  
+  R_adj <- summary(model)$adj.r.squared
+  R_adj_thr <- c(R_adj_thr, R_adj)
+  pval_thr <- c(pval_thr, summary(model)$coefficients[,4][2])
+
+  R_adj <- summary(model_cov)$adj.r.squared - null_r2
+  R_adj_null_thr <- c(R_adj_null_thr, R_adj)
+  pval_nul_thr <- c(pval_nul_thr, summary(model_cov)$coefficients[,4][5])
+  
+}
+
+names (R_adj_thr) <-  prs_bmi %>% select (contains ("Pt")) %>% colnames()
+#names (pval_thr) <- prs_bmi %>% select (contains ("Pt")) %>% colnames()
+
+
+
+#Plot the Rsquared by threshold
+ggplot (data.frame (R_adj = R_adj_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: ", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Plot the Rsquared by threshold taking into account covariates
+ggplot (data.frame (R_adj = R_adj_null_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_nul_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: Adjusted", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Plot the regression of the best predictive model
+prs_df %>%
+  filter (Timeframe_non == "Postfamine") %>% 
+  ggplot(aes (x = .data[[thresholds[which(R_adj_null_thr == max(R_adj_null_thr))]]], y = .data[[trait]])) +
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  labs (title = sprintf("Regresion: %s ~ best PRS", trait)) +
+  stat_cor() +
+  theme_bw()
+```
+
+
+
+
+
+
+
+
+
+
+
+### Birth weight
+
+
+
+Definition of the trait for which the regression is calculated. 
+```{r}
+trait <- "birth_weight"
+```
+
+Loading the scores and a creating a df with the metadata of the available patients
+```{r, results = "hide"}
+prs <- read_table("../Miguel_PRS/results/Body_Mass_Index.fixed-rsIDs.QC/Body_Mass_Index.fixed-rsIDs.QC.PRSice.all_score")
+
+
+
+
+
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", "mkigegew", "both_views")), prs) %>% left_join(., pcs) %>% rename (birth_weight = mkigegew)
+```
+
+Calculation of the null linear model with the covariates:
+```{r}
+null_model <- lm (paste0(trait, "~."), data =  (prs_df %>% filter (Timeframe_non == "Postfamine") %>%  select(contains ("PC"), trait)))
+null_r2 <- summary (null_model)$r.squared
+```
+
+
+
+```{r, warning = FALSE}
+thresholds <- prs %>% select (contains ("Pt")) %>% colnames()
+
+R_adj_thr <- c()
+pval_thr <- c()
+
+R_adj_null_thr <- c()
+pval_nul_thr <- c()
+
+#Compute the regresion for all the thresholds
+for (i in thresholds) {
+  
+  model <- lm (paste (trait, "~", i[[1]]), data = prs_df %>% filter (Timeframe_non == "Postfamine"))
+  
+  #model with covariates
+  model_cov <- lm (paste(trait, "~ ."), data = (prs_df %>% filter (Timeframe_non == "Postfamine") %>%  select(contains ("PC"), i, trait)))
+  
+  R_adj <- summary(model)$adj.r.squared
+  R_adj_thr <- c(R_adj_thr, R_adj)
+  pval_thr <- c(pval_thr, summary(model)$coefficients[,4][2])
+
+  R_adj <- summary(model_cov)$adj.r.squared - null_r2
+  R_adj_null_thr <- c(R_adj_null_thr, R_adj)
+  pval_nul_thr <- c(pval_nul_thr, summary(model_cov)$coefficients[,4][5])
+  
+}
+
+names (R_adj_thr) <-  prs_bmi %>% select (contains ("Pt")) %>% colnames()
+#names (pval_thr) <- prs_bmi %>% select (contains ("Pt")) %>% colnames()
+
+
+
+#Plot the Rsquared by threshold
+ggplot (data.frame (R_adj = R_adj_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: ", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Plot the Rsquared by threshold taking into account covariates
+ggplot (data.frame (R_adj = R_adj_null_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_nul_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: Adjusted", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Plot the regression of the best predictive model
+prs_df %>%
+  filter (Timeframe_non == "Postfamine") %>% 
+  ggplot(aes (x = .data[[thresholds[which(R_adj_null_thr == max(R_adj_null_thr))]]], y = .data[[trait]])) +
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  labs (title = sprintf("Regresion: %s ~ best PRS", trait)) +
+  stat_cor() +
+  theme_bw()
+
+
+
+
+```
+
+
+
+
+### Tobacco smoking
+
+```{r, results = "hide"}
+
+trait = "smoking"
+
+prs <- read_table("../Miguel_PRS/results/Current_tobacco_smoking.QC/Current_tobacco_smoking.QC.PRSice.all_score")
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", "smoking2", "both_views")), prs) %>% left_join(., pcs) %>% rename (smoking = smoking2)
+
+```
+
+
+Calculation of the null linear model with the covariates:
+```{r}
+null_model <- glm (paste0(trait, "~."), data =  (prs_df %>% filter (Timeframe_non == "Postfamine") %>%  select(contains ("PC"), trait)))
+null_r2 <-  DescTools::PseudoR2(null_model, which = "Nagelkerke")
+```
+
+
+
+
+```{r,  warning = FALSE}
+
+
+pseudoR2_thr <- c()
+
+for (i in thresholds){
+  model <- glm (paste (trait, "~", i[[1]]), data = prs_df %>% filter (Timeframe_non == "Postfamine") %>% select(contains ("PC"), i, trait), family = "binomial")
+  pseudoR2 <- DescTools::PseudoR2(model, which = "Nagelkerke")
+  pseudoR2_thr <- c(pseudoR2_thr, pseudoR2 - null_r2)
+}
+
+
+names (pseudoR2_thr) <-  prs %>% select (contains ("Pt")) %>% colnames()
+
+#Plot the Rsquared by threshold
+ggplot (data.frame (PseudoR2 = pseudoR2_thr,
+                    thresholds = (prs_bw %>% select (contains ("Pt")) %>% colnames())),
+        aes (x = thresholds,  y = PseudoR2 )) + 
+  geom_bar(stat = "identity") +
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: Pseudo", R^{2})), 
+       title = "Smoking PRS")+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+model_smk <- glm (smoking~Pt_0.05, data = prs_smk_df %>% filter (Timeframe_non == "Postfamine"), family = "binomial")
+
+#Plot the regression of the best predictive model
+prs_smk_df %>%
+  filter (Timeframe_non == "Postfamine") %>%
+  drop_na() %>% 
+  ggplot(aes (x = .data[[thresholds[which(pseudoR2_thr == max(pseudoR2_thr))]]], y = smoking)) +
+  #geom_boxplot(aes(y = as.factor(smoking)))+
+  geom_point() + 
+  geom_smooth(method = "glm", method.args = list (family = "binomial")) +
+  # geom_line (data = data.frame(x = seq(-0.00017, -0.000135, 0.000001),
+  #                              y = predict (model_smk,
+  #                                           newdata = data.frame (Pt_0.05 = seq(-0.00017, -0.000135, 0.000001)),
+  #                                           type = "response")),
+  #            aes(x,y),color = "grey50")+
+  scale_y_continuous()+
+  scale_x_continuous()+
+  theme_bw()
+
+
+
+
+# #Plot the Rsquared by threshold taking into account covariates
+# ggplot (data.frame (R_adj = R_adj_null_thr,
+#                     thresholds = thresholds, 
+#                     p.val = pval_nul_thr),
+#         aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+#   geom_bar(stat = "identity") +
+#   geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+#                   label = signif(p.val,3)), 
+#              size = 2.5)+
+#   labs(x = "Pval thresholds", 
+#        y = expression(paste("PRS model fit: Adjusted", R^{2})), 
+#        title = paste (trait, " PRS"))+
+#   theme_bw()+
+#   theme (axis.text.x = element_text(angle = 45, hjust = 1))
+# 
+# #Plot the regression of the best predictive model
+# prs_df %>%
+#   filter (Timeframe_non == "Postfamine") %>% 
+#   ggplot(aes (x = .data[[thresholds[which(R_adj_null_thr == max(R_adj_null_thr))]]], y = .data[[trait]])) +
+#   geom_point() + 
+#   geom_smooth(method = "lm") + 
+#   labs (title = sprintf("Regresion: %s ~ best PRS", trait)) +
+#   stat_cor() +
+#   theme_bw()
+# 
+
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+```{r, results = "hide"}
+trait = smoking
+
+prs_smk <- read_table("../Miguel_PRS/results/Current_tobacco_smoking.QC/Current_tobacco_smoking.QC.PRSice.all_score")
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs_smk$SXS <-prs_smk$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_smk_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", "smoking2", "both_views")), prs_smk) %>% rename (smoking = smoking2)
+
+```
+
+
+Calculation of the null linear model with the covariates:
+```{r}
+null_model <- glm (paste0(trait, "~."), data =  (prs_df %>% filter (Timeframe_non == "Postfamine") %>%  select(contains ("PC"), trait)))
+null_r2 <- summary (null_model)$r.squared
+```
+
+
+
+
+```{r,  warning = FALSE}
+
+
+pseudoR2_thr <- c()
+
+for (i in thresholds){
+  model_smk <- glm (paste("smoking ~", i[[1]]), data = prs_smk_df %>% filter (Timeframe_non == "Postfamine"), family = "binomial")
+  pseudoR2 <- DescTools::PseudoR2(model_smk, which = "Nagelkerke")
+  pseudoR2_thr <- c(pseudoR2_thr, pseudoR2)
+}
+
+
+names (pseudoR2_thr) <-  prs_smk %>% select (contains ("Pt")) %>% colnames()
+
+#Plot the Rsquared by threshold
+ggplot (data.frame (PseudoR2 = pseudoR2_thr,
+                    thresholds = (prs_bw %>% select (contains ("Pt")) %>% colnames())),
+        aes (x = thresholds,  y = PseudoR2 )) + 
+  geom_bar(stat = "identity") +
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: Pseudo", R^{2})), 
+       title = "Smoking PRS")+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+model_smk <- glm (smoking~Pt_0.05, data = prs_smk_df %>% filter (Timeframe_non == "Postfamine"), family = "binomial")
+
+#Plot the regression of the best predictive model
+prs_smk_df %>%
+  filter (Timeframe_non == "Postfamine") %>%
+  drop_na() %>% 
+  ggplot(aes (x = .data[[thresholds[which(pseudoR2_thr == max(pseudoR2_thr))]]], y = smoking)) +
+  #geom_boxplot(aes(y = as.factor(smoking)))+
+  geom_point() + 
+  geom_smooth(method = "glm", method.args = list (family = "binomial")) +
+  # geom_line (data = data.frame(x = seq(-0.00017, -0.000135, 0.000001),
+  #                              y = predict (model_smk,
+  #                                           newdata = data.frame (Pt_0.05 = seq(-0.00017, -0.000135, 0.000001)),
+  #                                           type = "response")),
+  #            aes(x,y),color = "grey50")+
+  scale_y_continuous()+
+  scale_x_continuous()+
+  theme_bw()
+
+```
+
+### HDL 
+
+
+
+Definition of the trait for which the regression is calculated. 
+```{r}
+trait <- "hdl"
+```
+
+Loading the scores and a creating a df with the metadata of the available patients
+```{r, results = "hide"}
+prs <- read_table("../Miguel_PRS/results/HDL_cholesterol.QC.r2/HDL_cholesterol.QC.all_score")
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", trait, "both_views")), prs) %>% left_join(., pcs)
+```
+
+Calculation of the null linear model with the covariates:
+```{r}
+null_model <- lm (paste0(trait, "~."), data =  (prs_df %>% filter (Timeframe_non == "Postfamine") %>%  select(contains ("PC"), trait)))
+null_r2 <- summary (null_model)$r.squared
+```
+
+
+
+```{r, warning = FALSE}
+thresholds <- prs %>% select (contains ("Pt")) %>% colnames()
+
+R_adj_thr <- c()
+pval_thr <- c()
+
+R_adj_null_thr <- c()
+pval_nul_thr <- c()
+
+#Compute the regresion for all the thresholds
+for (i in thresholds) {
+  
+  model <- lm (paste (trait, "~", i[[1]]), data = prs_df %>% filter (Timeframe_non == "Postfamine"))
+  
+  #model with covariates
+  model_cov <- lm (paste(trait, "~ ."), data = (prs_df %>% filter (Timeframe_non == "Postfamine") %>%  select(contains ("PC"), i, trait)))
+  
+  R_adj <- summary(model)$adj.r.squared
+  R_adj_thr <- c(R_adj_thr, R_adj)
+  pval_thr <- c(pval_thr, summary(model)$coefficients[,4][2])
+
+  R_adj <- summary(model_cov)$adj.r.squared - null_r2
+  R_adj_null_thr <- c(R_adj_null_thr, R_adj)
+  pval_nul_thr <- c(pval_nul_thr, summary(model_cov)$coefficients[,4][5])
+  
+}
+
+names (R_adj_thr) <-  prs_bmi %>% select (contains ("Pt")) %>% colnames()
+#names (pval_thr) <- prs_bmi %>% select (contains ("Pt")) %>% colnames()
+
+
+
+#Plot the Rsquared by threshold
+ggplot (data.frame (R_adj = R_adj_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: ", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Plot the Rsquared by threshold taking into account covariates
+ggplot (data.frame (R_adj = R_adj_null_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_nul_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: Adjusted", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Plot the regression of the best predictive model
+prs_df %>%
+  filter (Timeframe_non == "Postfamine") %>% 
+  ggplot(aes (x = .data[[thresholds[which(R_adj_null_thr == max(R_adj_null_thr))]]], y = .data[[trait]])) +
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  labs (title = sprintf("Regresion: %s ~ best PRS", trait)) +
+  stat_cor() +
+  theme_bw()
+```
+
+
+
+
+
+### LDL 
+
+
+Definition of the trait for which the regression is calculated. 
+```{r}
+trait <- "ldl"
+```
+
+Loading the scores and a creating a df with the metadata of the available patients
+```{r, results = "hide"}
+prs <- read_table("../Miguel_PRS/results/LDL_cholesterol.QC.r2/LDL_cholesterol.QC.all_score")
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", trait, "both_views")), prs) %>% left_join(., pcs)
+```
+
+Calculation of the null linear model with the covariates:
+```{r}
+null_model <- lm (paste0(trait, "~."), data =  (prs_df %>% filter (Timeframe_non == "Postfamine") %>%  select(contains ("PC"), trait)))
+null_r2 <- summary (null_model)$r.squared
+```
+
+
+
+```{r, warning = FALSE}
+thresholds <- prs %>% select (contains ("Pt")) %>% colnames()
+
+R_adj_thr <- c()
+pval_thr <- c()
+
+R_adj_null_thr <- c()
+pval_nul_thr <- c()
+
+#Compute the regresion for all the thresholds
+for (i in thresholds) {
+  
+  model <- lm (paste (trait, "~", i[[1]]), data = prs_df %>% filter (Timeframe_non == "Postfamine"))
+  
+  #model with covariates
+  model_cov <- lm (paste(trait, "~ ."), data = (prs_df %>% filter (Timeframe_non == "Postfamine") %>%  select(contains ("PC"), i, trait)))
+  
+  R_adj <- summary(model)$adj.r.squared
+  R_adj_thr <- c(R_adj_thr, R_adj)
+  pval_thr <- c(pval_thr, summary(model)$coefficients[,4][2])
+
+  R_adj <- summary(model_cov)$adj.r.squared - null_r2
+  R_adj_null_thr <- c(R_adj_null_thr, R_adj)
+  pval_nul_thr <- c(pval_nul_thr, summary(model_cov)$coefficients[,4][5])
+  
+}
+
+names (R_adj_thr) <-  prs_bmi %>% select (contains ("Pt")) %>% colnames()
+#names (pval_thr) <- prs_bmi %>% select (contains ("Pt")) %>% colnames()
+
+
+
+#Plot the Rsquared by threshold
+ggplot (data.frame (R_adj = R_adj_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: ", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Plot the Rsquared by threshold taking into account covariates
+ggplot (data.frame (R_adj = R_adj_null_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_nul_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: Adjusted", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Plot the regression of the best predictive model
+prs_df %>%
+  filter (Timeframe_non == "Postfamine") %>% 
+  ggplot(aes (x = .data[[thresholds[which(R_adj_null_thr == max(R_adj_null_thr))]]], y = .data[[trait]])) +
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  labs (title = sprintf("Regresion: %s ~ best PRS", trait)) +  stat_cor() +
+  theme_bw()
+```
+
+
+### Heigth
+
+
+
+### Glucose
+```{r}
+samples_metadata %>% select (contains ("gluc")) %>% colnames()
+```
+
+
+
+
+
+
+
+
+
+
+
+## All controls
+
+
+Load the data: 
+```{r}
+
+all_prs_df <- readRDS("OUTPUT/PRS/rds/all_prs_df.rds")
+
+regre_out <- "OUTPUT/PRS/regression"
+
+# Check if output folder exist
+if (!dir.exists(regre_out)) {
+  dir.create(regre_out)
+} 
+
+```
+
+
+
+### BMI
+
+Definition of the trait for which the regression is calculated. 
+```{r}
+trait <- "bmi"
+
+# Create folder output
+if (!dir.exists(file.path(regre_out, trait))) {
+  dir.create(file.path(regre_out, trait))
+} 
+
+
+```
+
+Loading the scores and a creating a df with the metadata of the available patients
+```{r, results = "hide"}
+prs <- read_table("../Miguel_PRS/results/Body_Mass_Index.fixed-rsIDs.QC/Body_Mass_Index.fixed-rsIDs.QC.PRSice.all_score")
+
+
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", trait, "both_views")), prs) %>% left_join(., pcs)
+```
+
+Calculation of the null linear model with the covariates:
+```{r}
+null_model <- lm (paste0(trait, "~."), data =  (prs_df %>% filter (Exposure == "Non") %>%  select(contains ("PC"), trait)))
+null_r2 <- summary (null_model)$r.squared
+```
+
+
+
+```{r, warning = FALSE}
+thresholds <- prs %>% select (contains ("Pt")) %>% colnames()
+
+R_adj_thr <- c()
+pval_thr <- c()
+
+R_adj_null_thr <- c()
+pval_nul_thr <- c()
+
+#Compute the regresion for all the thresholds
+for (i in thresholds) {
+  
+  model <- lm (paste (trait, "~", i[[1]]), data = prs_df %>% filter (Exposure == "Non"))
+  
+  #model with covariates
+  model_cov <- lm (paste(trait, "~ ."), data = (prs_df %>% filter (Exposure == "Non") %>%  select(contains ("PC"), i, trait)))
+  
+  R_adj <- summary(model)$adj.r.squared
+  R_adj_thr <- c(R_adj_thr, R_adj)
+  pval_thr <- c(pval_thr, summary(model)$coefficients[,4][2])
+
+  R_adj <- summary(model_cov)$adj.r.squared - null_r2
+  R_adj_null_thr <- c(R_adj_null_thr, R_adj)
+  pval_nul_thr <- c(pval_nul_thr, summary(model_cov)$coefficients[,4][5])
+  
+}
+
+# names (R_adj_thr) <-  prs_bmi %>% select (contains ("Pt")) %>% colnames()
+#names (pval_thr) <- prs_bmi %>% select (contains ("Pt")) %>% colnames()
+
+
+
+#Plot the Rsquared by threshold
+ggplot (data.frame (R_adj = R_adj_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: ", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Plot the Rsquared by threshold taking into account covariates
+ggplot (data.frame (R_adj = R_adj_null_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_nul_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  # geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+  #                 label = signif(p.val,3)), 
+  #            size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: Adjusted", R^{2})), 
+       title = paste (str_to_upper(trait), " PRS"))+
+  theme_bw(base_size = 15)+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave (filename = paste0(trait, "_reg_cov.pdf"), path = file.path(regre_out, trait))
+
+#Plot the regression of the best predictive model
+prs_df %>%
+  filter (Exposure == "Non") %>% 
+  ggplot(aes (x = .data[[thresholds[which(R_adj_null_thr == max(R_adj_null_thr))]]], y = .data[[trait]])) +
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  labs (title = sprintf("Regresion: %s ~ best PRS", str_to_upper(trait)), 
+        y = str_to_upper (trait)) +
+  stat_cor() +
+  theme_bw( base_size = 15)
+
+ggsave (filename = paste0(trait, "_reg_cov_best_threshold.pdf"), path = file.path(regre_out, trait), width = 5)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Birth weight
+
+
+Definition of the trait for which the regression is calculated. 
+```{r}
+trait <- "birth_weight"
+
+# Create folder output
+if (!dir.exists(file.path(regre_out, trait))) {
+  dir.create(file.path(regre_out, trait))
+} 
+
+```
+
+Loading the scores and a creating a df with the metadata of the available patients
+```{r, results = "hide"}
+prs <- read_table("../Miguel_PRS/results/Body_Mass_Index.fixed-rsIDs.QC/Body_Mass_Index.fixed-rsIDs.QC.PRSice.all_score")
+
+
+
+
+
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", "mkigegew", "both_views")), prs) %>% left_join(., pcs) %>% rename (birth_weight = mkigegew)
+```
+
+Calculation of the null linear model with the covariates:
+```{r}
+null_model <- lm (paste0(trait, "~."), data =  (prs_df %>% filter (Exposure == "Non") %>%  select(contains ("PC"), trait)))
+null_r2 <- summary (null_model)$r.squared
+```
+
+
+
+```{r, warning = FALSE}
+thresholds <- prs %>% select (contains ("Pt")) %>% colnames()
+
+R_adj_thr <- c()
+pval_thr <- c()
+
+R_adj_null_thr <- c()
+pval_nul_thr <- c()
+
+#Compute the regresion for all the thresholds
+for (i in thresholds) {
+  
+  model <- lm (paste (trait, "~", i[[1]]), data = prs_df %>% filter (Exposure == "Non"))
+  
+  #model with covariates
+  model_cov <- lm (paste(trait, "~ ."), data = (prs_df %>% filter (Exposure == "Non") %>%  select(contains ("PC"), i, trait)))
+  
+  R_adj <- summary(model)$adj.r.squared
+  R_adj_thr <- c(R_adj_thr, R_adj)
+  pval_thr <- c(pval_thr, summary(model)$coefficients[,4][2])
+
+  R_adj <- summary(model_cov)$adj.r.squared - null_r2
+  R_adj_null_thr <- c(R_adj_null_thr, R_adj)
+  pval_nul_thr <- c(pval_nul_thr, summary(model_cov)$coefficients[,4][5])
+  
+}
+
+# names (R_adj_thr) <-  prs_bmi %>% select (contains ("Pt")) %>% colnames()
+#names (pval_thr) <- prs_bmi %>% select (contains ("Pt")) %>% colnames()
+
+
+
+#Plot the Rsquared by threshold
+ggplot (data.frame (R_adj = R_adj_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: ", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Plot the Rsquared by threshold taking into account covariates
+ggplot (data.frame (R_adj = R_adj_null_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_nul_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  # geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+  #                 label = signif(p.val,3)), 
+  #            size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: Adjusted", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw(base_size = 15)+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave (filename = paste0(trait, "_reg_cov.pdf"), path = file.path(regre_out, trait))
+
+#Plot the regression of the best predictive model
+prs_df %>%
+  filter (Exposure == "Non") %>% 
+  ggplot(aes (x = .data[[thresholds[which(R_adj_null_thr == max(R_adj_null_thr))]]], y = .data[[trait]])) +
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  labs (title = sprintf("Regresion: %s ~ best PRS", trait)) +
+  stat_cor() +
+  theme_bw(base_size = 15)
+
+ggsave (filename = paste0(trait, "_reg_cov_best_threshold.pdf"), path = file.path(regre_out, trait), width = 5)
+```
+
+
+
+
+
+
+### HDL 
+
+
+
+Definition of the trait for which the regression is calculated. 
+```{r}
+trait <- "hdl"
+
+# Create folder output
+if (!dir.exists(file.path(regre_out, trait))) {
+  dir.create(file.path(regre_out, trait))
+} 
+```
+
+Loading the scores and a creating a df with the metadata of the available patients
+```{r, results = "hide"}
+prs <- read_table("../Miguel_PRS/results/HDL_cholesterol.QC.r2/HDL_cholesterol.QC.all_score")
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", trait, "both_views")), prs) %>% left_join(., pcs)
+```
+
+Calculation of the null linear model with the covariates:
+```{r}
+null_model <- lm (paste0(trait, "~."), data =  (prs_df %>% filter (Exposure == "Non") %>%  select(contains ("PC"), trait)))
+null_r2 <- summary (null_model)$r.squared
+```
+
+
+
+```{r, warning = FALSE}
+thresholds <- prs %>% select (contains ("Pt")) %>% colnames()
+
+R_adj_thr <- c()
+pval_thr <- c()
+
+R_adj_null_thr <- c()
+pval_nul_thr <- c()
+
+#Compute the regresion for all the thresholds
+for (i in thresholds) {
+  
+  model <- lm (paste (trait, "~", i[[1]]), data = prs_df %>% filter (Exposure == "Non"))
+  
+  #model with covariates
+  model_cov <- lm (paste(trait, "~ ."), data = (prs_df %>% filter (Exposure == "Non") %>%  select(contains ("PC"), i, trait)))
+  
+  R_adj <- summary(model)$adj.r.squared
+  R_adj_thr <- c(R_adj_thr, R_adj)
+  pval_thr <- c(pval_thr, summary(model)$coefficients[,4][2])
+
+  R_adj <- summary(model_cov)$adj.r.squared - null_r2
+  R_adj_null_thr <- c(R_adj_null_thr, R_adj)
+  pval_nul_thr <- c(pval_nul_thr, summary(model_cov)$coefficients[,4][5])
+  
+}
+
+# names (R_adj_thr) <-  prs_bmi %>% select (contains ("Pt")) %>% colnames()
+#names (pval_thr) <- prs_bmi %>% select (contains ("Pt")) %>% colnames()
+
+
+
+#Plot the Rsquared by threshold
+ggplot (data.frame (R_adj = R_adj_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: ", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Plot the Rsquared by threshold taking into account covariates
+ggplot (data.frame (R_adj = R_adj_null_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_nul_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  # geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+  #                 label = signif(p.val,3)), 
+  #            size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: Adjusted", R^{2})), 
+       title = paste (str_to_upper( trait), " PRS"))+
+  theme_bw(base_size = 15)+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+ggsave (filename = paste0(trait, "_reg_cov.pdf"), path = file.path(regre_out, trait))
+
+#Plot the regression of the best predictive model
+prs_df %>%
+  filter (Exposure == "Non") %>% 
+  ggplot(aes (x = .data[[thresholds[which(R_adj_null_thr == max(R_adj_null_thr))]]], y = .data[[trait]])) +
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  labs (title = sprintf("Regresion: %s ~ best PRS", str_to_upper( trait)), 
+        y = str_to_upper (trait)) +
+  stat_cor() +
+  theme_bw(base_size = 15)
+
+
+ggsave (filename = paste0(trait, "_reg_cov_best_threshold.pdf"), path = file.path(regre_out, trait), width = 5)
+
+```
+
+
+
+
+
+
+### LDL 
+
+
+Definition of the trait for which the regression is calculated. 
+```{r}
+trait <- "ldl"
+
+# Create folder output
+if (!dir.exists(file.path(regre_out, trait))) {
+  dir.create(file.path(regre_out, trait))
+} 
+```
+
+Loading the scores and a creating a df with the metadata of the available patients
+```{r, results = "hide"}
+prs <- read_table("../Miguel_PRS/results/LDL_cholesterol.QC.r2/LDL_cholesterol.QC.all_score")
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", trait, "both_views")), prs) %>% left_join(., pcs)
+```
+
+Calculation of the null linear model with the covariates:
+```{r}
+null_model <- lm (paste0(trait, "~."), data =  (prs_df %>% filter (Exposure == "Non") %>%  select(contains ("PC"), trait)))
+null_r2 <- summary (null_model)$r.squared
+```
+
+
+
+```{r, warning = FALSE}
+thresholds <- prs %>% select (contains ("Pt")) %>% colnames()
+
+R_adj_thr <- c()
+pval_thr <- c()
+
+R_adj_null_thr <- c()
+pval_nul_thr <- c()
+
+#Compute the regresion for all the thresholds
+for (i in thresholds) {
+  
+  model <- lm (paste (trait, "~", i[[1]]), data = prs_df %>% filter (Exposure == "Non"))
+  
+  #model with covariates
+  model_cov <- lm (paste(trait, "~ ."), data = (prs_df %>% filter (Exposure == "Non") %>%  select(contains ("PC"), i, trait)))
+  
+  R_adj <- summary(model)$adj.r.squared
+  R_adj_thr <- c(R_adj_thr, R_adj)
+  pval_thr <- c(pval_thr, summary(model)$coefficients[,4][2])
+
+  R_adj <- summary(model_cov)$adj.r.squared - null_r2
+  R_adj_null_thr <- c(R_adj_null_thr, R_adj)
+  pval_nul_thr <- c(pval_nul_thr, summary(model_cov)$coefficients[,4][5])
+  
+}
+
+# names (R_adj_thr) <-  prs_bmi %>% select (contains ("Pt")) %>% colnames()
+#names (pval_thr) <- prs_bmi %>% select (contains ("Pt")) %>% colnames()
+
+
+
+#Plot the Rsquared by threshold
+ggplot (data.frame (R_adj = R_adj_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+                  label = signif(p.val,3)), 
+             size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: ", R^{2})), 
+       title = paste (trait, " PRS"))+
+  theme_bw()+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Plot the Rsquared by threshold taking into account covariates
+ggplot (data.frame (R_adj = R_adj_null_thr,
+                    thresholds = thresholds, 
+                    p.val = pval_nul_thr),
+        aes (x = thresholds,  y = R_adj, fill = -log10(p.val) )) + 
+  geom_bar(stat = "identity") +
+  # geom_text (aes (y = R_adj + (sign (R_adj) * mean(abs(R_adj_thr))/20),
+  #                 label = signif(p.val,3)), 
+  #            size = 2.5)+
+  labs(x = "Pval thresholds", 
+       y = expression(paste("PRS model fit: Adjusted", R^{2})), 
+       title = paste (str_to_upper( trait), " PRS"))+
+  theme_bw(base_size = 15)+
+  theme (axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave (filename = paste0(trait, "_reg_cov.pdf"), path = file.path(regre_out, trait))
+
+#Plot the regression of the best predictive model
+prs_df %>%
+  filter (Exposure == "Non") %>% 
+  ggplot(aes (x = .data[[thresholds[which(R_adj_null_thr == max(R_adj_null_thr))]]], y = .data[[trait]])) +
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  labs (title = sprintf("Regresion: %s ~ best PRS", str_to_upper( trait)),
+        y = str_to_upper(trait))+  stat_cor() +
+  theme_bw(base_size = 15)
+
+ggsave (filename = paste0(trait, "_reg_cov_best_threshold.pdf"), path = file.path(regre_out, trait), width = 5)
+
+```
+
+
+
+
+
+
+
+
+
+
+## PRS distribution 
+
+
+### BMI
+
+
+Definition of the trait for which the regression is calculated. 
+```{r}
+trait <- "bmi"
+```
+
+Loading the scores and a creating a df with the metadata of the available patients
+```{r, results = "hide"}
+prs <- read_table("../Miguel_PRS/results/Body_Mass_Index.fixed-rsIDs.QC/Body_Mass_Index.fixed-rsIDs.QC.PRSice.all_score")
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", trait, "both_views", "target")), prs) %>% left_join(., pcs)
+
+```
+
+
+
+```{r}
+
+prs_df <- prs_df %>% pivot_longer(cols = contains("Pt"), names_to = "thresholds", values_to = "PRS")
+
+prs_df %>% ggplot (aes (x = PRS, fill = target)) + 
+  geom_density (alpha = 0.3 ) + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free") + 
+  theme_bw()
+
+
+prs_df %>% ggplot (aes (y = PRS, x = target, fill = target)) + 
+  geom_boxplot (alpha = 0.3 ) + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free") + 
+  stat_compare_means(method = "t.test")+
+  theme_bw()
+
+
+prs_df %>% ggplot (aes (x = PRS, y = target, color = target)) + 
+  geom_violin (alpha = 0.3 ) + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free") + 
+  theme_bw()
+
+```
+
+
+
+### HDL
+
+
+Definition of the trait for which the regression is calculated. 
+```{r}
+trait <- "hdl"
+```
+
+Loading the scores and a creating a df with the metadata of the available patients
+```{r, results = "hide"}
+prs <- read_table("../Miguel_PRS/results/HDL_cholesterol.QC.r2/HDL_cholesterol.QC.all_score")
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+prs$SXS <-prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+prs_df <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", trait, "both_views", "target")), prs) %>% left_join(., pcs)
+
+```
+
+
+
+```{r}
+prs_df <- prs_df %>% pivot_longer(cols = contains("Pt"), names_to = "thresholds", values_to = "PRS")
+
+prs_df %>% ggplot (aes (x = PRS, fill = target)) + 
+  geom_density (alpha = 0.3 ) + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free") + 
+  theme_bw()
+
+
+prs_df %>% ggplot (aes (y = PRS, x = target, fill = target)) + 
+  geom_boxplot (alpha = 0.3 ) + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free") + 
+  stat_compare_means()+
+  theme_bw()
+
+```
+
+
+
+### Extraversion: 
+
+```{r}
+trait <- "Extraversion"
+
+prs_df <- df_all_prs %>%
+  select (IID, SXS, contains (trait)) %>%
+  inner_join(., (samples_metadata %>% select ("SXS", "id", "Exposure", "Timeframe_non", "Sex", "target"))) %>% 
+  pivot_longer (cols = contains ("Pt"), names_to = "thresholds", values_to = "PRS")
+
+prs_df %>% ggplot (aes (x = PRS, fill = target)) + 
+  geom_density (alpha = 0.3 ) + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free") + 
+  theme_bw()
+
+
+prs_df %>% ggplot (aes (y = PRS, x = target, fill = target)) + 
+  geom_boxplot (alpha = 0.3 ) + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free") + 
+  stat_compare_means()+
+  theme_bw()
+
+
+
+prs_df %>% ggplot (aes (y = PRS, x = Exposure, fill = Exposure)) + 
+  geom_boxplot (alpha = 0.3 ) + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free") + 
+  stat_compare_means(comparisons = list(c("Early", "Non")))+
+  theme_bw(base_size = 16)
+
+
+```
+
+
+### Fasting_insulin_interaction_adjusted_for_BMI: 
+
+```{r}
+trait <- "Fasting_insulin_interaction_adjusted_for_BMI"
+
+#Generation of the data-frame ----
+prs_df <- df_all_prs %>%
+  select (IID, SXS, contains (trait)) %>%
+  inner_join(., (samples_metadata %>% select ("SXS", "id", "Exposure", "Timeframe_non", "Sex", "target", "group"))) %>% 
+  pivot_longer (cols = contains ("Pt"), names_to = "thresholds", values_to = "PRS") %>% 
+  mutate (thresholds = str_extract (thresholds, "Pt_[0-9.]+"))
+
+
+#Generate the plots ----
+prs_df %>% ggplot (aes (x = PRS, fill = target)) + 
+  geom_density (alpha = 0.3 ) + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free") + 
+  theme_bw()
+
+
+prs_df %>% ggplot (aes (y = PRS, x = target, fill = target)) + 
+  geom_boxplot (alpha = 0.3 ) + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free") + 
+  stat_compare_means()+
+  theme_bw()
+
+
+
+prs_df %>% ggplot (aes (y = PRS, x = group, fill = group)) + 
+  geom_violin(alpha = 0.5)+
+  geom_boxplot (alpha = 0.3, width = 0.2, fill = "white", color = "black") + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free", labeller = labeller (thresholds = label_wrap_gen(width = 25))) + 
+  stat_compare_means(comparisons = list(c("Early", "Post"), c ("Early", "Pre")))+
+  labs(title = trait) +
+  theme_bw(base_size = 12)
+
+ggsave ("OUTPUT/PRS/PRS_distribution/test.png", width = 15, height = 10)
+
+
+```
+
+### All traits
+PRS distribution comparisson for all the traits. 
+```{r}
+
+traits <- df_all_prs %>% select (contains("Pt")) %>% colnames() %>% strsplit(., "-", fixed = TRUE) %>% sapply (., "[[", 2) %>% unique()
+
+
+for (trait in traits){
+  
+  #Generation of the data-frame ----
+  prs_df <- df_all_prs %>%
+  select (IID, SXS, contains (trait)) %>%
+  inner_join(., (samples_metadata %>% select ("SXS", "id", "Exposure", "Timeframe_non", "Sex", "target", "group"))) %>% 
+  pivot_longer (cols = contains ("Pt"), names_to = "thresholds", values_to = "PRS") %>% 
+  mutate (thresholds = str_extract (thresholds, "Pt_[0-9.]+"))
+  
+  #Generation of the plot ----
+  violin_plot <- prs_df %>% ggplot (aes (y = PRS, x = group, fill = group)) + 
+  geom_violin(alpha = 0.5)+
+  geom_boxplot (alpha = 0.3, width = 0.2, fill = "white", color = "black") + 
+  facet_wrap (~ thresholds, ncol = 5, scales = "free", labeller = labeller (thresholds = label_wrap_gen(width = 25))) + 
+  stat_compare_means(comparisons = list(c("Early", "Post"), c ("Early", "Pre")))+
+  labs(title = trait) +
+  theme_bw(base_size = 12)
+  
+  #Saving the plot ----
+  ggsave(plot = violin_plot, filename = paste0("OUTPUT/PRS/PRS_distribution/", trait, ".png"), width = 15, height = 10)
+}
+
+
+
+```
+
+
+
+
+
+## Statistical Test: 
+
+
+```{r}
+
+#Load the long format data: 
+df_all_prs <- readRDS("OUTPUT/PRS/rds/all_prs_df_long.rds")
+
+# #Transform into long format
+# if (! "thresholds" %in% df_all_prs){
+#   df_all_prs <- df_all_prs %>%
+#     pivot_longer (cols = contains("Pt"),
+#                   names_to = "thresholds",
+#                   values_to = "prs") %>%
+#     separate (thresholds, into = c("thresholds", "trait"), sep = "-")
+# 
+# }
+
+
+#Create the SXS column based on the FID one (the id is repeated and joined by and _)
+df_all_prs$SXS <- df_all_prs$FID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+```
+
+
+
+
+
+### Wilcox: 
+
+
+Early_Exposed VS Postfamine. 
+```{r}
+
+
+
+prs_grouped <- inner_join((samples_metadata %>% dplyr::select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", "both_views", "target")), df_all_prs) %>% split (., .$thresholds)
+
+target <- prs_grouped[[1]] %>% filter (Exposure == "Early" | Timeframe_non == "Postfamine") %>% pull(target)
+
+p_values <- sapply(prs_grouped,
+                function(x){apply(x %>%
+                                    filter(Exposure == "Early" | Timeframe_non == "Postfamine") %>% 
+                                    dplyr::select(contains ("PRS")),
+                                  2,
+                                  function (c){ wilcox.test(c ~ target)$p.value})}
+)
+
+
+p_values_cor <- p.adjust(p_values, method = "BH" ) %>% matrix(., ncol = 10)
+rownames (p_values_cor) <- rownames (p_values)
+colnames (p_values_cor) <- colnames(p_values)
+# 
+# heatmap(p_values,
+#         main = "Wilcox.test pval PRS", 
+#         scale = "none",
+#         Colv = NA, 
+#         textCol = "black")
+
+
+# unadjusted
+dat2 <-
+  p_values %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+# ggsave("OUTPUT/PRS/stat_plots/EvPf_pval_wilcox.test.png", width = 20, height = 25)
+ggsave("OUTPUT/PRS/stat_plots/EvPostf_pval_wilcox.test.pdf", width = 20, height = 25, device = "pdf")
+  
+
+
+#adjusted pval
+
+dat2 <-
+  p_values_cor %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values_cor)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+# ggsave("OUTPUT/PRS/stat_plots/EvPf_pval_adj_wilcox.test.png", width = 20, height = 25)
+ggsave("OUTPUT/PRS/stat_plots/EvPostf_pval_adj_wilcox.test.pdf", width = 20, height = 25, device = "pdf")
+
+```
+
+Load model muvr EEvPf (PRS) to select only the top variables. 
+```{r}
+
+model_muvr <- readRDS("OUTPUT/feature_selection_methylation/rds/muvr_EEvPF_prs.rds")
+top_var <- getVIP(model_muvr, model = "mid")$name
+
+
+top_prs <- sapply (top_var[1:15], function(x) {str_replace(x, "Pt_[0-9](\\.[0-9]+)?-", "")}) %>% unique()
+
+
+top_prs <- str_split_fixed(top_var, pattern = "-", n = 2)  %>% as.tibble()
+colnames (top_prs ) = c("Threshold", "PRS")
+
+
+dat2 <-
+  p_values_cor %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values_cor)) %>%
+  filter (PRS %in% (paste0("PRS_", unique(top_prs$PRS)))) %>% 
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+
+dat2 <- dat2 %>%
+  mutate (top_var = do.call (paste0, dat2 %>%
+                               dplyr::select (Threshold, PRS) %>%
+                               mutate (PRS = str_remove(PRS, "PRS_"))) %in% do.call (paste0, top_prs)
+          )
+
+
+plot1 <- dat2 %>% mutate (PRS = str_remove(PRS, "PRS_")) %>% 
+  ggplot(aes(Threshold, y = fct_relevel (PRS, rev(unique(top_prs$PRS)) ))) +
+  geom_tile(aes(fill = p.value)) +
+  geom_point(data = . %>% filter (top_var == TRUE), 
+             shape = 0,
+             size = 13)+
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  labs(y = NULL)+
+  theme_bw(base_size = 16) + 
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+
+plot1
+
+ggsave("OUTPUT/PRS/stat_plots/EvPostf_pval_adj_wilcox.test_filter.pdf", width = 12, height = 8, device = "pdf")
+```
+
+
+
+
+
+Early_Exposed + Mid_Exposed VS Postfamine. 
+```{r}
+
+
+
+prs_grouped <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", "both_views", "target")), df_all_prs) %>% split (., .$thresholds)
+
+target <- prs_grouped[[1]] %>% filter (Exposure %in% c("Early", "Mid") | Timeframe_non == "Postfamine") %>% pull(target)
+
+p_values <- sapply(prs_grouped,
+                function(x){apply(x %>%
+                                    filter (Exposure %in% c("Early", "Mid") | Timeframe_non == "Postfamine") %>% 
+                        select(contains ("PRS")),
+                      2,
+                      function (c){ wilcox.test(c ~ target)$p.value})}
+     )
+
+
+p_values_cor <- p.adjust(p_values, method = "BH" ) %>% matrix(., ncol = 10)
+rownames (p_values_cor) <- rownames (p_values)
+colnames (p_values_cor) <- colnames(p_values)
+# 
+# heatmap(p_values,
+#         main = "Wilcox.test pval PRS", 
+#         scale = "none",
+#         Colv = NA, 
+#         textCol = "black")
+
+
+# unadjusted
+dat2 <-
+  p_values %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+# ggsave("OUTPUT/PRS/stat_plots/E_MEvPf_pval_wilcox.test.png", width = 20, height = 25)
+ggsave("OUTPUT/PRS/stat_plots/E_MEvPostf_pval_wilcox.test.pdf", width = 20, height = 25, device = "pdf")
+  
+
+
+#adjusted pval
+
+dat2 <-
+  p_values_cor %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values_cor)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+# ggsave("OUTPUT/PRS/stat_plots/E_MEvPf_pval_adj_wilcox.test.png", width = 20, height = 25)
+ggsave("OUTPUT/PRS/stat_plots/E_MEvPostf_pval_adj_wilcox.test.pdf", width = 20, height = 25, device = "pdf")
+
+```
+
+
+Early_Exposed VS Non_exposed 
+```{r}
+
+
+
+prs_grouped <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", "both_views", "target")), df_all_prs) %>% split (., .$thresholds)
+
+target <- prs_grouped[[1]] %>% filter (Exposure == "Early" | Exposure == "Non") %>% pull(target)
+
+p_values <- sapply(prs_grouped,
+                function(x){apply(x %>%
+                                    filter(Exposure == "Early" | Exposure == "Non") %>% 
+                        select(contains ("PRS")),
+                      2,
+                      function (c){ wilcox.test(c ~ target)$p.value})}
+     )
+
+
+p_values_cor <- p.adjust(p_values, method = "BH" ) %>% matrix(., ncol = 10)
+rownames (p_values_cor) <- rownames (p_values)
+colnames (p_values_cor) <- colnames(p_values)
+# 
+# heatmap(p_values,
+#         main = "Wilcox.test pval PRS", 
+#         scale = "none",
+#         Colv = NA, 
+#         textCol = "black")
+
+
+# unadjusted
+dat2 <-
+  p_values %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+# ggsave("OUTPUT/PRS/stat_plots/EvPf_pval_wilcox.test.png", width = 20, height = 25)
+ggsave("OUTPUT/PRS/stat_plots/EvNE_pval_wilcox.test.pdf", width = 20, height = 25, device = "pdf")
+  
+
+
+#adjusted pval
+
+dat2 <-
+  p_values_cor %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values_cor)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+# ggsave("OUTPUT/PRS/stat_plots/EvPf_pval_adj_wilcox.test.png", width = 20, height = 25)
+ggsave("OUTPUT/PRS/stat_plots/EvNE_pval_adj_wilcox.test.pdf", width = 20, height = 25, device = "pdf")
+
+```
+
+
+Mid_Exposed VS Non_exposed 
+```{r}
+
+
+
+prs_grouped <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", "both_views", "target")), df_all_prs) %>% split (., .$thresholds)
+
+target <- prs_grouped[[1]] %>% filter (Exposure == "Mid" | Exposure == "Non") %>% pull(target)
+
+p_values <- sapply(prs_grouped,
+                function(x){apply(x %>%
+                                    filter(Exposure == "Mid" | Exposure == "Non") %>% 
+                        select(contains ("PRS")),
+                      2,
+                      function (c){ wilcox.test(c ~ target)$p.value})}
+     )
+
+
+p_values_cor <- p.adjust(p_values, method = "BH" ) %>% matrix(., ncol = 10)
+rownames (p_values_cor) <- rownames (p_values)
+colnames (p_values_cor) <- colnames(p_values)
+# 
+# heatmap(p_values,
+#         main = "Wilcox.test pval PRS", 
+#         scale = "none",
+#         Colv = NA, 
+#         textCol = "black")
+
+
+# unadjusted
+dat2 <-
+  p_values %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+ggsave("OUTPUT/PRS/stat_plots/MvNE_pval_wilcox.test.pdf", width = 20, height = 25, device = "pdf")
+  
+
+
+#adjusted pval
+
+dat2 <-
+  p_values_cor %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values_cor)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+ggsave("OUTPUT/PRS/stat_plots/MvNE_pval_adj_wilcox.test.pdf", width = 20, height = 25, device = "pdf")
+
+```
+
+
+
+Late_Exposed VS Non_exposed 
+```{r}
+
+
+
+prs_grouped <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", "both_views", "target")), df_all_prs) %>% split (., .$thresholds)
+
+target <- prs_grouped[[1]] %>% filter (Exposure == "Late" | Exposure == "Non") %>% pull(target)
+
+p_values <- sapply(prs_grouped,
+                function(x){apply(x %>%
+                                    filter(Exposure == "Late" | Exposure == "Non") %>% 
+                        select(contains ("PRS")),
+                      2,
+                      function (c){ wilcox.test(c ~ target)$p.value})}
+     )
+
+
+p_values_cor <- p.adjust(p_values, method = "BH" ) %>% matrix(., ncol = 10)
+rownames (p_values_cor) <- rownames (p_values)
+colnames (p_values_cor) <- colnames(p_values)
+# 
+# heatmap(p_values,
+#         main = "Wilcox.test pval PRS", 
+#         scale = "none",
+#         Colv = NA, 
+#         textCol = "black")
+
+
+# unadjusted
+dat2 <-
+  p_values %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+ggsave("OUTPUT/PRS/stat_plots/LvNE_pval_wilcox.test.pdf", width = 20, height = 25, device = "pdf")
+  
+
+
+#adjusted pval
+
+dat2 <-
+  p_values_cor %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values_cor)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 3))) +
+  geom_text(aes (label = round (p.value, 3)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+ggsave("OUTPUT/PRS/stat_plots/LvNE_pval_adj_wilcox.test.pdf", width = 20, height = 25, device = "pdf")
+
+```
+
+### t.test
+```{r}
+
+
+
+prs_grouped <- inner_join((samples_metadata %>% select ("SXS", "SampleID", "Exposure", "Birthdate", "Timeframe_non", "Sex", "both_views", "target")), df_all_prs) %>% split (., .$thresholds)
+
+p_values <- sapply(prs_grouped,
+                function(x){apply(x %>%
+                        select(contains ("PRS")),
+                      2,
+                      function (c){ t.test(c ~ prs_grouped[[1]]$target)$p.value})}
+     )
+
+
+p_values_cor <- p.adjust(p_values, method = "BH" ) %>% matrix(., ncol = 10)
+rownames (p_values_cor) <- rownames (p_values)
+colnames (p_values_cor) <- colnames(p_values)
+# 
+# heatmap(p_values,
+#         main = "Wilcox.test pval PRS", 
+#         scale = "none",
+#         Colv = NA, 
+#         textCol = "black")
+
+
+# unadjusted
+dat2 <-
+  p_values %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 2))) +
+  geom_text(aes (label = round (p.value, 2)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+ggsave("OUTPUT/PRS/pval_t.test.png", width = 20, height = 25)
+  
+
+
+#adjusted pval
+
+dat2 <-
+  p_values_cor %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values_cor)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 2))) +
+  geom_text(aes (label = round (p.value, 2)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+ggsave("OUTPUT/PRS/adj_pval_t.test.png", width = 20, height = 25)
+```
+
+
+
+
+### ANOVA 
+```{r}
+p_values <- sapply(prs_grouped,
+                function(x){apply(x %>%
+                        select(contains ("PRS")),
+                      2,
+                      function (c){ 
+                        anova <- aov(c ~ prs_grouped[[1]]$Exposure)
+                        summary(anova)[[1]][["Pr(>F)"]][1]
+                        })}
+     )
+
+
+p_values_cor <- p.adjust(p_values, method = "BH" ) %>% matrix(., ncol = 10)
+rownames (p_values_cor) <- rownames (p_values)
+colnames (p_values_cor) <- colnames(p_values)
+
+
+#pvalues
+dat2 <-
+  p_values %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 2))) +
+  geom_text(aes (label = round (p.value, 2)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white", limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+ggsave("OUTPUT/PRS/pval_anova.png", width = 20, height = 25)
+
+
+
+#adjusted pval
+dat2 <-
+  p_values_cor %>%
+  as_tibble() %>%
+  mutate(PRS = rownames(p_values_cor)) %>%
+  pivot_longer(-PRS, names_to = "Threshold", values_to = "p.value")
+
+
+ggplot(dat2, aes(Threshold, PRS)) +
+  geom_tile(aes(fill = p.value)) +
+  geom_text(aes(label = round(p.value, 2))) +
+  geom_text(aes (label = round (p.value, 2)), color = "blue", data = . %>% filter (p.value  <= 0.05))+ 
+  scale_fill_gradient(low = "red", high = "white" , limits = c(0,1)) +
+  theme_bw(base_size = 16)
+
+ggsave("OUTPUT/PRS/adj_pval_anova.png", width = 20, height = 25)
+  
+```
+
+
+
+

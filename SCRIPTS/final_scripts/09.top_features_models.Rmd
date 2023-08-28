@@ -1,0 +1,717 @@
+---
+title: "top_features_methylation_allExposed.Rmd"
+author: "Miguel Parra"
+date: '2023-06-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 0. Set-up
+
+```{r}
+library ("tidyverse") 
+library ("ggplot2")
+library ("minfi")
+library ("MUVR")
+library ("doParallel")
+library ("bigsnpr")
+library ("bigstatsr")
+library ("pROC")
+library ("randomForest")
+library ("caret")
+library ("Rtsne")
+library ("janitor")
+```
+
+Import data:
+
+```{r}
+
+#Metadata: ----
+samples_metadata <- readRDS("OUTPUT/feature_selection/rds/samples_metadata.rds")
+
+
+#Methylation data: ----
+grset <- readRDS("OUTPUT/methylation_preprocessing/rdsDir/grset_normalized_noSNPs_noSex.Rds")
+beta_values <- getBeta (grset)
+mval <- getM(grset)
+
+```
+
+
+```{r}
+beta_variance <- apply (beta_values, 1, var)
+
+#Select only values with high variance (top 50%)
+betas_fil_var <- beta_values[ beta_variance >  quantile (beta_variance, 0.50),]
+```
+
+
+```{r}
+
+samples_metadata %>% filter (id %in% colnames(beta_values)) %>% tabyl(target)
+
+```
+
+
+
+
+
+## EE+ME+LE (EvNE)
+
+
+```{r}
+samples_metadata_fil <- samples_metadata %>% filter (id %in% colnames (beta_values))
+```
+
+
+```{r}
+betas_fil <- t(betas_fil_var[,samples_metadata_fil$id])
+mval_fil <- t (mval[rownames(betas_fil_var), samples_metadata_fil$id])
+
+```
+
+
+
+
+### T.test filter
+
+Model: 
+
+```{r}
+
+y_train <- samples_metadata_fil$target
+
+##Methylation data: 
+
+# Select top variables with lower pval
+pval_betas <- apply (betas_fil,
+                     2,
+                     function (j) { t.test (j ~ y_train)$p.val})
+
+betas_fil <- betas_fil [, sort (pval_betas, index.return = TRUE)$ix[1:4000]]
+
+###MUVR
+
+cl = makeCluster(10)
+doParallel::registerDoParallel(cl)
+
+model_muvr <- MUVR( X =  betas_fil, 
+                       Y = y_train, 
+                       nRep = 10, 
+                       nOuter = 5, 
+                       varRatio = 0.7, 
+                       method = "RF", 
+                       fitness = "AUROC", 
+                       modReturn = TRUE)
+
+stopCluster(cl)
+
+#Selecting the most important features according to the
+top_var <- getVIP(model_muvr, model = "mid")$name
+
+
+```
+
+```{r}
+saveRDS(model_muvr, "OUTPUT/top_features_models/rds/muvr_allExposed.rds")
+```
+
+```{r}
+plotVIP(model_muvr, n = 20)
+getVIP(model_muvr)
+```
+
+
+### limma
+
+
+Model: 
+
+```{r}
+
+y_train <- samples_metadata_fil$target
+
+##Methylation data: 
+
+# Select top variables with lower pval according to the limma fit
+
+
+modelmat <- model.matrix(~ 0 + target + Sex + Age, data = samples_metadata_fil %>%
+                           mutate (Sex = ifelse (Sex == 1, "Male", "Female"),
+                                   target = make.names(target)))
+
+fit <- lmFit(t(mval_fil), modelmat)
+
+contrasts <- makeContrasts (targetExposed- targetNon.exposed, levels = modelmat)
+
+fit2 <- contrasts.fit (fit, contrasts )
+
+fit2 <- eBayes(fit2)
+
+top_table <- topTable(fit2,coef=ncol(modelmat), number = "inf", sort.by = "p", adjust.method = "BH")
+
+
+betas_fil <- betas_fil [, rownames(top_table)[1:4000]]
+
+
+
+###MUVR
+
+cl = makeCluster(10)
+doParallel::registerDoParallel(cl)
+
+model_muvr <- MUVR( X =  betas_fil, 
+                       Y = y_train, 
+                       nRep = 10, 
+                       nOuter = 5, 
+                       varRatio = 0.7, 
+                       method = "RF", 
+                       fitness = "AUROC", 
+                       modReturn = TRUE)
+
+stopCluster(cl)
+
+#Selecting the most important features according to the
+top_var <- getVIP(model_muvr, model = "mid")$name
+
+
+```
+
+```{r}
+saveRDS(model_muvr, "OUTPUT/top_features_models/rds/muvr_allExposed_limma_filter.rds")
+```
+
+
+## EE + ME (EMEvPF)
+
+Samples selection
+
+```{r}
+samples_metadata_fil <- samples_metadata %>% filter (id %in% colnames (beta_values))%>% filter (Exposure %in% c("Early", "Mid") | Timeframe_non == "Postfamine" )
+```
+
+
+```{r}
+
+betas_fil <- t(betas_fil_var[,samples_metadata_fil$id])
+
+```
+
+
+Model: 
+
+```{r}
+
+y_train <- samples_metadata_fil$target
+
+##Methylation data: 
+
+
+##Methylation data: 
+
+# Select top variables with lower pval
+pval_betas <- apply (betas_fil,
+                     2,
+                     function (j) { t.test (j ~ y_train)$p.val})
+
+betas_fil <- betas_fil [, sort (pval_betas, index.return = TRUE)$ix[1:4000]]
+
+###MUVR
+
+cl = makeCluster(10)
+doParallel::registerDoParallel(cl)
+
+model_muvr <- MUVR( X =  betas_fil, 
+                       Y = y_train, 
+                       nRep = 10, 
+                       nOuter = 5, 
+                       varRatio = 0.7, 
+                       method = "RF", 
+                       fitness = "AUROC", 
+                       modReturn = TRUE)
+
+stopCluster(cl)
+
+#Selecting the most important features according to the
+top_var <- getVIP(model_muvr, model = "mid")$name
+```
+
+
+```{r}
+saveRDS(model_muvr, "OUTPUT/top_features_models/rds/muvr_EMEvPF.rds")
+```
+
+Load the model: 
+```{r}
+model_muvr <- readRDS("OUTPUT/top_features_models/rds/muvr_EMEvPF.rds")
+```
+
+
+
+```{r}
+plotVIP(model_muvr, n = 20)
+getVIP(model_muvr)
+```
+
+
+```{r}
+VIPRep = model_muvr$VIPPerRep[[2]]
+
+vip_plot <- VIPRep %>% 
+  as.data.frame() %>%
+  mutate (mean = apply (VIPRep, 1, mean)) %>%
+  arrange (mean) %>%
+  slice_head(n = 20) %>% 
+  rownames_to_column(var = "top_var") %>% 
+  pivot_longer(cols = contains("rep"), names_to = "rep", values_to = "VIPrep" ) %>% 
+  ggplot (aes (y = reorder(top_var, mean, decreasing = TRUE) , x = VIPrep)) +
+  geom_boxplot()+ 
+  labs (y = "Top variables",
+        x = "Ranking",
+        title = "Top variables RF Beta-values",
+        subtitle = "Binary classification: EE + ME vs PF") +
+  theme_bw(base_size = 15)
+
+vip_plot
+
+ggsave(filename = "top_var_betas_EMEvPF.pdf", plot = vip_plot, path = "OUTPUT/top_features_models" )
+
+
+# reorder(carrier,speed,na.rm = TRUE)
+```
+
+
+3 variables selected in all the folds ("cg08582801" "cg14120049" "cg11144229")
+9 variables selected in 4 different folds ("cg08582801" "cg25669494" "cg14120049" "cg15815084" "cg11144229" "cg12634080" "cg21020855" "cg03736826" "cg12002139")
+
+
+
+
+## ME (MEvPF) 
+
+
+Samples selection
+
+```{r}
+samples_metadata_fil <- samples_metadata %>% filter (id %in% colnames (beta_values))%>% filter (Exposure == "Mid" | Timeframe_non == "Postfamine" )
+```
+
+
+```{r}
+
+betas_fil <- t(betas_fil_var[,samples_metadata_fil$id])
+mval_fil <- mval[colnames (betas_fil),samples_metadata_fil$id]
+
+```
+
+
+Model: 
+
+```{r}
+
+y_train <- samples_metadata_fil$target
+
+##Methylation data: 
+
+
+##Methylation data: 
+
+# Select top variables with lower pval
+pval_betas <- apply (betas_fil,
+                     2,
+                     function (j) { t.test (j ~ y_train)$p.val})
+
+betas_fil <- betas_fil [, sort (pval_betas, index.return = TRUE)$ix[1:4000]]
+
+###MUVR
+
+cl = makeCluster(10)
+doParallel::registerDoParallel(cl)
+
+model_muvr <- MUVR( X =  betas_fil, 
+                       Y = y_train, 
+                       nRep = 10, 
+                       nOuter = 5, 
+                       varRatio = 0.7, 
+                       method = "RF", 
+                       fitness = "AUROC", 
+                       modReturn = TRUE)
+
+stopCluster(cl)
+
+#Selecting the most important features according to the
+top_var <- getVIP(model_muvr, model = "mid")$name
+```
+
+
+```{r}
+saveRDS(model_muvr, "OUTPUT/top_features_models/rds/muvr_MEvPF.rds")
+```
+
+Load the model: 
+```{r}
+model_muvr <- readRDS("OUTPUT/top_features_models/rds/muvr_MEvPF.rds")
+```
+
+
+
+```{r}
+plotVIP(model_muvr, n = 20)
+getVIP(model_muvr)
+```
+
+
+
+```{r}
+VIPRep = model_muvr$VIPPerRep[[2]]
+
+vip_plot <- VIPRep %>% 
+  as.data.frame() %>%
+  mutate (mean = apply (VIPRep, 1, mean)) %>%
+  arrange (mean) %>%
+  slice_head(n = 15) %>% 
+  rownames_to_column(var = "top_var") %>% 
+  pivot_longer(cols = contains("rep"), names_to = "rep", values_to = "VIPrep" ) %>% 
+  ggplot (aes (y = reorder(top_var, mean, decreasing = TRUE) , x = VIPrep)) +
+  geom_boxplot()+ 
+  labs (y = "Top variables",
+        x = "Ranking",
+        title = "Top variables RF Beta-values",
+        subtitle = "Binary classification: ME vs PF") +
+  theme_bw(base_size = 15)
+
+vip_plot
+
+ggsave(filename = "top_var_betas_MEvPF.pdf", plot = vip_plot, path = "OUTPUT/top_features_models", units = "in" )
+
+
+# reorder(carrier,speed,na.rm = TRUE)
+```
+
+
+
+
+
+
+
+
+### limma
+
+
+Model: 
+
+```{r}
+
+y_train <- samples_metadata_fil$target
+
+
+## Add cell type distribution to data
+cell_estimate <- readRDS("OUTPUT/methylation_preprocessing/rdsDir/cell_estimate.rds")
+samples_metadata_fil <- cell_estimate %>% as.data.frame() %>% rownames_to_column("id") %>% left_join(samples_metadata_fil, .)
+
+##Methylation data: 
+
+# Select top variables with lower pval according to the limma fit
+
+
+modelmat <- model.matrix(~ 0 + target + Sex + Age + Array + CD8T + CD4T + NK + Bcell + Mono + Gran,
+                         data = samples_metadata_fil %>%
+                           mutate (Sex = ifelse (Sex == 1, "Male", "Female"),
+                                   target = make.names(target)))
+
+fit <- lmFit( mval_fil, modelmat)
+
+contrasts <- makeContrasts (targetExposed- targetNon.exposed, levels = modelmat)
+
+fit2 <- contrasts.fit (fit, contrasts )
+
+fit2 <- eBayes(fit2)
+
+top_table <- topTable(fit2, number = "inf", adjust.method = "BH", sort.by = "p", coef = 1)
+
+
+betas_fil <- betas_fil [, rownames(top_table)[1:4000]]
+
+
+
+###MUVR
+
+cl = makeCluster(10)
+doParallel::registerDoParallel(cl)
+
+model_muvr <- MUVR( X =  betas_fil, 
+                       Y = y_train, 
+                       nRep = 10, 
+                       nOuter = 5, 
+                       varRatio = 0.7, 
+                       method = "RF", 
+                       fitness = "AUROC", 
+                       modReturn = TRUE)
+
+stopCluster(cl)
+
+#Selecting the most important features according to the
+top_var <- getVIP(model_muvr, model = "mid")$name
+
+
+```
+
+
+
+```{r}
+saveRDS(model_muvr, "OUTPUT/top_features_models/rds/muvr_MEvPF_limma_filter.rds")
+```
+
+load model 
+
+```{r}
+model_muvr <- readRDS("OUTPUT/top_features_models/rds/muvr_MEvPF_limma_filter.rds")
+```
+
+
+
+
+```{r}
+VIPRep = model_muvr$VIPPerRep[[3]]
+
+vip_plot <- VIPRep %>% 
+  as.data.frame() %>%
+  mutate (mean = apply (VIPRep, 1, mean)) %>%
+  arrange (mean) %>%
+  slice_head(n = 15) %>% 
+  rownames_to_column(var = "top_var") %>% 
+  pivot_longer(cols = contains("rep"), names_to = "rep", values_to = "VIPrep" ) %>% 
+  ggplot (aes (y = reorder(top_var, mean, decreasing = TRUE) , x = VIPrep)) +
+  geom_boxplot()+ 
+  labs (y = "Top variables",
+        x = "Ranking",
+        title = "Top variables RF Beta-values",
+        subtitle = "Binary classification: ME vs PF") +
+  theme_bw(base_size = 15)
+
+vip_plot
+
+ggsave(filename = "top_var_betas_MEvPF_limma.pdf", plot = vip_plot, path = "OUTPUT/top_features_models", units = "in", width = 6, height = 6)
+```
+
+
+
+
+
+
+
+
+## EE (PRS)
+
+
+load data: 
+```{r}
+
+#PRS: ----
+df_all_prs <- readRDS("OUTPUT/PRS/rds/all_prs_df.rds")
+df_all_prs$SXS <- df_all_prs$IID %>% str_split(., "_1") %>% sapply (., "[[", 1)
+
+#Matrix with PRS
+mt_all_prs <- df_all_prs %>% filter (SXS %in% samples_metadata$SXS) %>%  dplyr::select(contains("Pt")) %>% as.matrix()
+rownames (mt_all_prs) <-  df_all_prs %>% filter (SXS %in% samples_metadata$SXS) %>% pull (SXS) 
+```
+
+
+Subsample the metadata df to remove only samples that don't have PRS calculated. 
+```{r}
+samples_metadata_fil_prs <- samples_metadata %>% filter (Exposure == "Early" | Timeframe_non == "Postfamine") %>% filter (SXS %in% rownames (mt_all_prs))
+```
+
+Selection of PRS samples
+```{r}
+mt_prs <- mt_all_prs[samples_metadata_fil_prs$SXS, ]
+```
+
+
+
+
+Model: 
+
+```{r}
+
+y_train <- samples_metadata_fil_prs$target
+
+##Methylation data: 
+
+
+##Methylation data: 
+
+# Select top variables with lower pval
+
+
+###MUVR
+
+cl = makeCluster(10)
+doParallel::registerDoParallel(cl)
+
+model_muvr <- MUVR( X =  mt_prs, 
+                       Y = y_train, 
+                       nRep = 10, 
+                       nOuter = 5, 
+                       varRatio = 0.7, 
+                       method = "RF", 
+                       fitness = "AUROC", 
+                       modReturn = TRUE)
+
+stopCluster(cl)
+
+#Selecting the most important features according to the
+top_var <- getVIP(model_muvr, model = "mid")$name
+
+
+```
+
+```{r}
+saveRDS(model_muvr, "OUTPUT/top_features_models/rds/muvr_EEvPF_prs.rds")
+
+```
+
+
+Load the model: 
+```{r}
+model_muvr <- readRDS("OUTPUT/top_features_models/rds/muvr_EEvPF_prs.rds")
+```
+
+
+
+```{r}
+VIPRep = model_muvr$VIPPerRep[[2]]
+
+top_var_rep <- VIPRep %>%
+  as.data.frame() %>%
+  mutate (mean = apply (VIPRep, 1, mean)) %>%
+  arrange (mean) %>%
+  slice_head(n = 24) %>%
+  rownames_to_column(var = "top_var") 
+
+top_var_rep %>% pivot_longer(cols = contains("rep"), names_to = "rep", values_to = "VIPrep" ) %>% 
+  ggplot (aes (y = reorder(top_var, mean, decreasing = TRUE) , x = VIPrep)) +
+  geom_boxplot()+
+  labs (y = "Top variables",
+        x = "Ranking",
+        title = "Top variables RF PRS",
+        subtitle = "Binary classification: EE vs PF") +
+  theme_bw(base_size = 14)
+
+
+ggsave ("OUTPUT/top_features_models/top_var_PRS_EE.pdf", width = 10, height = 7)
+
+# reorder(carrier,speed,na.rm = TRUE)
+```
+
+
+
+
+## EE (SNPs)
+
+load data: 
+```{r}
+
+snp_array <- readRDS("OUTPUT/genomic_preprocessing/rdsDir/bigSNPr_prepro.rds")
+
+G <- snp_fastImputeSimple(snp_array$genotypes, method = "mode") #Imputing the remaining missing values
+maf <- snp_MAF(G)
+G <- G[]
+
+
+colnames(G) <- snp_array$map$marker.ID
+rownames(G) <- snp_array$fam$family.ID
+
+
+G_fil <- G[samples_metadata_fil$SXS, which (maf > 0.1)]
+
+```
+
+
+Subsample the metadata df to remove only samples that don't have PRS calculated. 
+```{r}
+samples_metadata_fil<- samples_metadata %>% filter (Exposure == "Early" | Timeframe_non == "Postfamine") %>% filter (SXS %in% rownames(G))
+
+G_fil <- G_fil[samples_metadata_fil$SXS,]
+
+```
+
+
+
+
+```{r}
+
+y_train <- samples_metadata_fil$target
+
+
+pval_xsqr <- apply (G_fil,2, function(j){chisq.test(j, y_train)$p.val})
+#Selection of the top 5000 snps that correlate with target. 
+G_fil_train <-  G_fil[, sort(pval_xsqr, index.return = TRUE)$ix[1:4000]]
+
+
+
+
+###MUVR
+
+cl = makeCluster(10)
+doParallel::registerDoParallel(cl)
+
+model_muvr <- MUVR( X = G_fil_train, 
+                       Y = y_train, 
+                       nRep = 10, 
+                       nOuter = 5, 
+                       varRatio = 0.7, 
+                       method = "RF", 
+                       fitness = "AUROC", 
+                       modReturn = TRUE)
+
+stopCluster(cl)
+
+
+
+#Selecting the most important features according to the
+top_var <- getVIP(model_muvr, model = "mid")$name
+```
+
+
+```{r}
+saveRDS(model_muvr, "OUTPUT/top_features_models/rds/muvr_EEvPF_SNPs.rds")
+
+```
+
+
+Load the model: 
+```{r}
+model_muvr <- readRDS("OUTPUT/top_features_models/rds/muvr_EEvPF_SNPs.rds")
+```
+
+
+
+```{r}
+VIPRep = model_muvr$VIPPerRep[[2]]
+
+top_var_rep <- VIPRep %>%
+  as.data.frame() %>%
+  mutate (mean = apply (VIPRep, 1, mean)) %>%
+  arrange (mean) %>%
+  slice_head(n = 20) %>%
+  rownames_to_column(var = "top_var") 
+
+top_var_rep %>% pivot_longer(cols = contains("rep"), names_to = "rep", values_to = "VIPrep" ) %>% 
+  ggplot (aes (y = reorder(top_var, mean, decreasing = TRUE) , x = VIPrep)) +
+  geom_boxplot()+
+  labs (y = "Top variables",
+        x = "Ranking",
+        title = "Top variables RF SNP",
+        subtitle = "Binary classification: EE vs Post") +
+  theme_bw(base_size = 16)
+
+
+ggsave ("OUTPUT/top_features_models/top_var_SNP_EE.pdf", width = 10, height = 7, units = "in")
+
+# reorder(carrier,speed,na.rm = TRUE)
+```
